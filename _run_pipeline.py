@@ -4013,7 +4013,7 @@ def main():
 
 
 # AUTO-RUN FOR NOTEBOOKS (Kaggle/Colab)
-if RUNNING_IN_NOTEBOOK:
+if RUNNING_IN_NOTEBOOK and os.environ.get("SPADUPA_DISABLE_AUTORUN", "0") != "1":
     # In notebook: run automatically with default settings
     print("🧬 Running NDM-1 Mutation Hotspot Predictor...")
     print("   (To customize, call: run_pipeline(epochs=100, n_ensemble=5, ...))")

@@ -14,6 +14,7 @@ that family's canonical reference sequence in the FASTA.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import sys
@@ -29,6 +30,9 @@ import pandas as pd
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
+
+# Avoid auto-running the full pipeline when importing _run_pipeline in Kaggle.
+os.environ.setdefault("SPADUPA_DISABLE_AUTORUN", "1")
 
 
 def parse_args() -> argparse.Namespace:
@@ -80,6 +84,20 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=2,
         help="ESM-2 batch size (default: 2)",
+    )
+    parser.add_argument(
+        "--curated-mutations",
+        type=str,
+        default="data/curated_mutations.json",
+        help=(
+            "Optional JSON file of curated validated mutation positions per family "
+            "(default: data/curated_mutations.json)."
+        ),
+    )
+    parser.add_argument(
+        "--curated-zero-indexed",
+        action="store_true",
+        help="Treat curated positions as 0-indexed (default assumes 1-indexed).",
     )
     return parser.parse_args()
 
@@ -152,6 +170,63 @@ def make_sequence_reference_data() -> Tuple[str, List[int]]:
     return NDM1_SEQUENCE, known_positions
 
 
+def leave_one_out_validation(scores: np.ndarray, known_positions: Sequence[int]) -> Dict[str, float]:
+    """Leave-one-out validation based on rank of each known position."""
+    if not known_positions:
+        return {
+            "loo_mean_rank": np.nan,
+            "loo_median_rank": np.nan,
+            "loo_mean_percentile": np.nan,
+            "loo_fraction_top30": np.nan,
+        }
+    n_positions = len(scores)
+    loo_ranks = []
+    for held_out_pos in known_positions:
+        if 0 <= held_out_pos < n_positions:
+            held_out_score = scores[held_out_pos]
+            rank = int(np.sum(scores > held_out_score) + 1)
+            loo_ranks.append(rank)
+    if not loo_ranks:
+        return {
+            "loo_mean_rank": np.nan,
+            "loo_median_rank": np.nan,
+            "loo_mean_percentile": np.nan,
+            "loo_fraction_top30": np.nan,
+        }
+    return {
+        "loo_mean_rank": float(np.mean(loo_ranks)),
+        "loo_median_rank": float(np.median(loo_ranks)),
+        "loo_mean_percentile": float(100 * (1 - np.mean(loo_ranks) / n_positions)),
+        "loo_fraction_top30": float(sum(1 for r in loo_ranks if r <= 30) / len(loo_ranks)),
+    }
+
+
+def load_curated_mutations(path: str, zero_indexed: bool = False) -> Dict[str, List[int]]:
+    """Load curated validated mutation positions from a JSON file."""
+    if not path:
+        return {}
+    curated_path = Path(path)
+    if not curated_path.exists():
+        return {}
+    with curated_path.open("r", encoding="utf-8") as handle:
+        data = json.load(handle)
+    curated: Dict[str, List[int]] = {}
+    for family, value in data.items():
+        positions: List[int] = []
+        if isinstance(value, dict) and "positions" in value:
+            positions = value.get("positions", [])
+        elif isinstance(value, list):
+            positions = value
+        try:
+            pos_list = [int(p) for p in positions]
+        except (TypeError, ValueError):
+            continue
+        if not zero_indexed:
+            pos_list = [p - 1 for p in pos_list if p > 0]
+        curated[str(family).upper()] = [p for p in pos_list if p >= 0]
+    return curated
+
+
 def build_chain_graph(n_residues: int) -> np.ndarray:
     adj = np.zeros((n_residues, n_residues), dtype=np.float32)
     for i in range(n_residues):
@@ -219,6 +294,38 @@ def project_embeddings_to_reference(
     return projected
 
 
+def get_observed_variant_positions(reference: FamilyRecord, records: Sequence[FamilyRecord]) -> List[int]:
+    positions: set[int] = set()
+    for rec in records:
+        if rec.header == reference.header:
+            continue
+        positions.update(project_variant_positions(reference.sequence, rec.sequence))
+    return sorted(positions)
+
+
+def evaluate_label_set(scores: Dict[str, np.ndarray], positive_positions: Sequence[int]) -> Tuple[Dict[str, float], np.ndarray]:
+    n_residues = len(scores["combined"])
+    valid_positions = [p for p in positive_positions if 0 <= p < n_residues]
+    y_true = np.array([1 if i in valid_positions else 0 for i in range(n_residues)], dtype=int)
+
+    from sklearn.metrics import roc_auc_score
+
+    metrics = {
+        "n_positive_positions": int(y_true.sum()),
+        "roc_auc_variance": np.nan,
+        "roc_auc_graph": np.nan,
+        "roc_auc_combined": np.nan,
+    }
+    if 0 < y_true.sum() < len(y_true):
+        metrics["roc_auc_variance"] = float(roc_auc_score(y_true, scores["variance"]))
+        metrics["roc_auc_graph"] = float(roc_auc_score(y_true, scores["graph"]))
+        metrics["roc_auc_combined"] = float(roc_auc_score(y_true, scores["combined"]))
+
+    loo = leave_one_out_validation(scores["combined"], valid_positions)
+    metrics.update(loo)
+    return metrics, y_true
+
+
 def compute_family_scores(
     reference_record: FamilyRecord,
     records: Sequence[FamilyRecord],
@@ -226,8 +333,7 @@ def compute_family_scores(
     alpha: float,
     hops: int,
     family: str,
-    known_positions: Optional[Sequence[int]] = None,
-) -> pd.DataFrame:
+) -> Tuple[pd.DataFrame, Dict[str, np.ndarray]]:
     ref_seq = reference_record.sequence
     n_residues = len(ref_seq)
 
@@ -237,15 +343,6 @@ def compute_family_scores(
         projected = project_embeddings_to_reference(ref_seq, rec.sequence, embeddings[rec.header])
         for pos, vec in projected.items():
             per_position_vectors[pos].append(vec)
-
-    if family == NDM_FAMILY and known_positions is not None:
-        positive_positions = set(known_positions)
-    else:
-        positive_positions = set()
-        for rec in records:
-            if rec.header == reference_record.header:
-                continue
-            positive_positions.update(project_variant_positions(ref_seq, rec.sequence))
 
     # Compute variance across homologs at each reference position.
     embedding_dim = next(iter(embeddings.values())).shape[1]
@@ -271,31 +368,23 @@ def compute_family_scores(
     biophysical = (dist - dist.min()) / (dist.max() - dist.min() + 1e-8)
     combined = 0.80 * propagated + 0.20 * biophysical
 
-    y_true = np.array([1 if i in positive_positions else 0 for i in range(n_residues)], dtype=int)
-    from sklearn.metrics import roc_auc_score
-
-    auc_values = {
-        "roc_auc_variance": np.nan,
-        "roc_auc_graph": np.nan,
-        "roc_auc_combined": np.nan,
-    }
-    if 0 < y_true.sum() < len(y_true):
-        auc_values["roc_auc_variance"] = roc_auc_score(y_true, var_norm)
-        auc_values["roc_auc_graph"] = roc_auc_score(y_true, propagated)
-        auc_values["roc_auc_combined"] = roc_auc_score(y_true, combined)
-
     df = pd.DataFrame(
         {
             "position": np.arange(1, n_residues + 1),
             "residue": list(ref_seq),
-            "label": y_true,
             "variance": var_norm,
             "graph": propagated,
             "combined": combined,
             "biophysical": biophysical,
         }
     )
-    return df, auc_values, positive_positions
+    scores = {
+        "variance": var_norm,
+        "graph": propagated,
+        "combined": combined,
+        "biophysical": biophysical,
+    }
+    return df, scores
 
 
 def main() -> int:
@@ -345,6 +434,8 @@ def main() -> int:
     batch_converter = alphabet.get_batch_converter()
     print(f"ESM-2 ready on {device}")
 
+    curated_map = load_curated_mutations(args.curated_mutations, args.curated_zero_indexed)
+
     summary_rows = []
     for family in order:
         records = family_records[family]
@@ -368,20 +459,24 @@ def main() -> int:
                 emb = out["representations"][33][i, 1 : len(rec.sequence) + 1].detach().cpu().numpy()
                 embeddings[rec.header] = emb
 
+        df, scores = compute_family_scores(
+            reference, records, embeddings, alpha=args.alpha, hops=args.hops, family=family
+        )
+
         if family == NDM_FAMILY:
-            df, auc_values, positive_positions = compute_family_scores(
-                reference, records, embeddings, alpha=args.alpha, hops=args.hops, family=family, known_positions=ndm_known_positions
-            )
+            primary_positions = list(ndm_known_positions)
             label_type = "curated_resistance_positions"
         else:
-            df, auc_values, positive_positions = compute_family_scores(
-                reference, records, embeddings, alpha=args.alpha, hops=args.hops, family=family
-            )
+            primary_positions = get_observed_variant_positions(reference, records)
             label_type = "observed_variant_positions"
+
+        primary_metrics, primary_labels = evaluate_label_set(scores, primary_positions)
+        primary_df = df.copy()
+        primary_df["label"] = primary_labels
 
         out_dir = Path(args.output) / family.lower()
         out_dir.mkdir(parents=True, exist_ok=True)
-        df.to_csv(out_dir / f"{family.lower()}_scores.csv", index=False)
+        primary_df.to_csv(out_dir / f"{family.lower()}_scores.csv", index=False)
 
         summary_rows.append(
             {
@@ -389,17 +484,44 @@ def main() -> int:
                 "reference": reference.header,
                 "n_sequences": len(records),
                 "label_type": label_type,
-                "n_positive_positions": int(df["label"].sum()),
-                "roc_auc_variance": auc_values["roc_auc_variance"],
-                "roc_auc_graph": auc_values["roc_auc_graph"],
-                "roc_auc_combined": auc_values["roc_auc_combined"],
+                "analysis_level": "primary",
+                **primary_metrics,
             }
         )
 
-        print(f"[{family}] positives: {int(df['label'].sum())}")
+        print(f"[{family}] positives: {primary_metrics['n_positive_positions']}")
         print(
-            f"[{family}] ROC-AUC variance={auc_values['roc_auc_variance']}, graph={auc_values['roc_auc_graph']}, combined={auc_values['roc_auc_combined']}"
+            f"[{family}] ROC-AUC variance={primary_metrics['roc_auc_variance']}, graph={primary_metrics['roc_auc_graph']}, combined={primary_metrics['roc_auc_combined']}"
         )
+        print(
+            f"[{family}] LOOCV mean rank={primary_metrics['loo_mean_rank']}, top30={primary_metrics['loo_fraction_top30']}"
+        )
+
+        curated_positions = curated_map.get(family)
+        if curated_positions:
+            curated_metrics, curated_labels = evaluate_label_set(scores, curated_positions)
+            curated_df = df.copy()
+            curated_df["label"] = curated_labels
+            curated_df.to_csv(out_dir / f"{family.lower()}_scores_high_conf.csv", index=False)
+
+            summary_rows.append(
+                {
+                    "family": family,
+                    "reference": reference.header,
+                    "n_sequences": len(records),
+                    "label_type": "curated_validated_mutations",
+                    "analysis_level": "high_confidence",
+                    **curated_metrics,
+                }
+            )
+            print(
+                f"[{family}] High-confidence ROC-AUC combined={curated_metrics['roc_auc_combined']}"
+            )
+        else:
+            if args.curated_mutations:
+                print(
+                    f"[{family}] No curated mutations found in {args.curated_mutations}; skipping high-confidence analysis."
+                )
 
     summary = pd.DataFrame(summary_rows)
     summary.to_csv(Path(args.output) / "enzyme_auc_summary.csv", index=False)
