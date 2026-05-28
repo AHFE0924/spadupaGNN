@@ -10,11 +10,19 @@ from __future__ import annotations
 import argparse
 import os
 import re
+import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
+
+# Ensure repo root and scripts directory are on sys.path.
+REPO_ROOT = Path(__file__).resolve().parents[1]
+SCRIPTS_DIR = REPO_ROOT / "scripts"
+for path in (str(REPO_ROOT), str(SCRIPTS_DIR)):
+    if path not in sys.path:
+        sys.path.insert(0, path)
 
 # Avoid auto-running the full pipeline when importing _run_pipeline.
 os.environ.setdefault("SPADUPA_DISABLE_AUTORUN", "1")
@@ -28,7 +36,7 @@ from sklearn.metrics import (
 )
 from sklearn.model_selection import GroupKFold
 
-from scripts.cluster_utils import (
+from cluster_utils import (
     greedy_cluster,
     load_cluster_csv,
     read_fasta_records,

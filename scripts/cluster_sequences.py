@@ -6,9 +6,16 @@ Uses cd-hit when available; falls back to a greedy Biopython alignment strategy.
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 
-from scripts.cluster_utils import (
+REPO_ROOT = Path(__file__).resolve().parents[1]
+SCRIPTS_DIR = REPO_ROOT / "scripts"
+for path in (str(REPO_ROOT), str(SCRIPTS_DIR)):
+    if path not in sys.path:
+        sys.path.insert(0, path)
+
+from cluster_utils import (
     greedy_cluster,
     read_fasta_records,
     run_cdhit,

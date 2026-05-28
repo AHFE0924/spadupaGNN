@@ -10,11 +10,17 @@ from __future__ import annotations
 
 import argparse
 import os
+import sys
 from pathlib import Path
 from typing import Dict, List, Optional
 
 import numpy as np
 import pandas as pd
+
+# Ensure repo root is on sys.path.
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 # Avoid auto-running the full pipeline when importing _run_pipeline.
 os.environ.setdefault("SPADUPA_DISABLE_AUTORUN", "1")
