@@ -6,3 +6,4 @@
 - Added GroupKFold cross-validation script with ROC/PR curves and mean/std AUC reporting.
 - Added residue-importance script to map embedding-based importance scores onto NDM-1 structure.
 - Fixed script import paths for Kaggle execution (groupkfold_cv, cluster_sequences, residue_importance).
+- Added GroupKFold guardrails for small cluster counts (write summary and exit cleanly).

@@ -272,7 +272,29 @@ def main() -> int:
 
     groups = [assignments.get(rec.id, -1) for rec in non_reference]
     unique_groups = len(set(groups))
-    n_splits = min(args.folds, max(2, unique_groups))
+    n_samples = len(non_reference)
+    if unique_groups < 2 or n_samples < 2:
+        summary_path = output_dir / f"cv_{family.lower()}_summary.csv"
+        pd.DataFrame(
+            [
+                {
+                    "family": family,
+                    "n_folds": 0,
+                    "mean_roc_auc": float("nan"),
+                    "std_roc_auc": float("nan"),
+                    "mean_pr_auc": float("nan"),
+                    "std_pr_auc": float("nan"),
+                    "note": "Not enough clusters or samples for GroupKFold",
+                }
+            ]
+        ).to_csv(summary_path, index=False)
+        print("Not enough clusters/samples for GroupKFold. Need >=2 clusters and >=2 sequences.")
+        print(f"Saved summary to {summary_path}")
+        return 0
+
+    n_splits = min(args.folds, unique_groups, n_samples)
+    if n_splits < 2:
+        n_splits = 2
 
     gkf = GroupKFold(n_splits=n_splits)
 
