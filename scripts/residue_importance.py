@@ -40,6 +40,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="cuda", help="cuda or cpu")
     parser.add_argument("--cache", default="output/embeddings_cache.npz", help="Embedding cache path")
     parser.add_argument("--pdb-id", default="3SPU", help="PDB ID for structure mapping")
+    parser.add_argument(
+        "--importance-method",
+        choices=["coef", "permutation"],
+        default="coef",
+        help="Residue importance method (default: coef)",
+    )
     return parser.parse_args()
 
 
@@ -169,8 +175,17 @@ def main() -> int:
     probs = model.predict_proba(X)[:, 1]
     auc = roc_auc_score(y, probs) if y.sum() > 0 else float("nan")
 
-    coef = model.coef_.reshape(-1)
-    importance = np.sum(np.abs(X * coef), axis=1)
+    if args.importance_method == "permutation":
+        from sklearn.inspection import permutation_importance
+
+        perm = permutation_importance(
+            model, X, y, n_repeats=30, random_state=42, scoring="roc_auc"
+        )
+        dim_importance = np.abs(perm.importances_mean)
+        importance = np.sum(np.abs(X) * dim_importance, axis=1)
+    else:
+        coef = model.coef_.reshape(-1)
+        importance = np.sum(np.abs(X * coef), axis=1)
     if importance.max() > 0:
         importance = importance / importance.max()
 

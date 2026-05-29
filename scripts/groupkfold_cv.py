@@ -231,6 +231,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--alpha", type=float, default=0.6, help="Propagation alpha")
     parser.add_argument("--hops", type=int, default=2, help="Propagation hops")
     parser.add_argument("--embed-cache", default="output/embeddings_cache.npz", help="Embedding cache path")
+    parser.add_argument("--permutations", type=int, default=200, help="Permutations for p-value estimation")
+    parser.add_argument("--bootstrap", type=int, default=500, help="Bootstrap samples for CI")
     return parser.parse_args()
 
 
@@ -314,6 +316,8 @@ def main() -> int:
     pr_curves = []
     aucs = []
     aps = []
+    fold_labels = []
+    fold_scores = []
 
     ref_seq = str(reference.seq)
 
@@ -341,6 +345,8 @@ def main() -> int:
         aps.append(ap)
         roc_curves.append((fpr, tpr, roc_auc))
         pr_curves.append((rec, prec, ap))
+        fold_labels.append(y_true)
+        fold_scores.append(scores["combined"])
 
         fold_rows.append(
             {
@@ -361,6 +367,49 @@ def main() -> int:
     mean_ap = float(np.mean(aps)) if aps else float("nan")
     std_ap = float(np.std(aps)) if aps else float("nan")
 
+    # Bootstrap CI for mean AUC/AP across folds
+    ci_auc_lower = float("nan")
+    ci_auc_upper = float("nan")
+    ci_ap_lower = float("nan")
+    ci_ap_upper = float("nan")
+    if len(aucs) >= 2:
+        rng = np.random.default_rng(42)
+        boot_means_auc = []
+        boot_means_ap = []
+        for _ in range(args.bootstrap):
+            idx = rng.integers(0, len(aucs), len(aucs))
+            boot_means_auc.append(np.mean(np.array(aucs)[idx]))
+            boot_means_ap.append(np.mean(np.array(aps)[idx]))
+        ci_auc_lower = float(np.percentile(boot_means_auc, 2.5))
+        ci_auc_upper = float(np.percentile(boot_means_auc, 97.5))
+        ci_ap_lower = float(np.percentile(boot_means_ap, 2.5))
+        ci_ap_upper = float(np.percentile(boot_means_ap, 97.5))
+
+    # Permutation test vs random baseline (mean across folds)
+    p_value_auc = float("nan")
+    p_value_ap = float("nan")
+    if fold_labels and args.permutations > 0:
+        rng = np.random.default_rng(123)
+        perm_mean_auc = []
+        perm_mean_ap = []
+        for _ in range(args.permutations):
+            perm_aucs = []
+            perm_aps = []
+            for y_true, y_scores in zip(fold_labels, fold_scores):
+                y_perm = rng.permutation(y_true)
+                if y_perm.sum() == 0 or y_perm.sum() == len(y_perm):
+                    continue
+                perm_aucs.append(roc_auc_score(y_perm, y_scores))
+                perm_aps.append(average_precision_score(y_perm, y_scores))
+            if perm_aucs:
+                perm_mean_auc.append(np.mean(perm_aucs))
+            if perm_aps:
+                perm_mean_ap.append(np.mean(perm_aps))
+        if perm_mean_auc:
+            p_value_auc = float((np.sum(np.array(perm_mean_auc) >= mean_auc) + 1) / (len(perm_mean_auc) + 1))
+        if perm_mean_ap:
+            p_value_ap = float((np.sum(np.array(perm_mean_ap) >= mean_ap) + 1) / (len(perm_mean_ap) + 1))
+
     summary = {
         "family": family,
         "n_folds": len(aucs),
@@ -368,6 +417,12 @@ def main() -> int:
         "std_roc_auc": std_auc,
         "mean_pr_auc": mean_ap,
         "std_pr_auc": std_ap,
+        "ci_roc_auc_lower": ci_auc_lower,
+        "ci_roc_auc_upper": ci_auc_upper,
+        "ci_pr_auc_lower": ci_ap_lower,
+        "ci_pr_auc_upper": ci_ap_upper,
+        "p_value_roc_auc": p_value_auc,
+        "p_value_pr_auc": p_value_ap,
     }
     pd.DataFrame([summary]).to_csv(output_dir / f"cv_{family.lower()}_summary.csv", index=False)
 
