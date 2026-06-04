@@ -28,3 +28,17 @@ Validate predictions against a DMS dataset:
 ```bash
 python scripts/dms_external_validation.py --dms path/to/dms.csv --predictions output/ndm1_mutation_scores.csv --mutation-column mutation --dms-score score
 ```
+
+## Synthetic validation suite
+Generate controlled synthetic datasets with planted hotspots and evaluate recovery:
+
+```bash
+# generate one dataset
+python scripts/simulate_superfamily.py --output-dir output/synthetic/example --seqs-per-family 20 --length 250 --motif HXD
+
+# evaluate with mock embeddings (fast) or real ESM embeddings
+python scripts/evaluate_synthetic.py --fasta output/synthetic/example/synthetic.fasta --labels output/synthetic/example/labels.json --output output/synthetic/example_eval --mock-embeddings
+
+# run the full multi-scenario suite
+python scripts/run_synthetic_suite.py --output-dir output/synthetic_suite --mock-embeddings
+```
