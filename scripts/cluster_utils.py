@@ -19,7 +19,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
-from Bio import SeqIO, pairwise2
+from Bio import SeqIO
+from Bio.Align import PairwiseAligner
 
 
 @dataclass
@@ -38,9 +39,15 @@ def sequence_identity(seq_a: str, seq_b: str) -> float:
     """Compute global alignment identity as matches / alignment length."""
     if seq_a == seq_b:
         return 1.0
-    alignment = pairwise2.align.globalxx(seq_a, seq_b, one_alignment_only=True)[0]
-    matches = sum(a == b for a, b in zip(alignment.seqA, alignment.seqB))
-    return matches / max(1, len(alignment.seqA))
+    aligner = PairwiseAligner()
+    aligner.mode = "global"
+    aligner.match_score = 1.0
+    aligner.mismatch_score = 0.0
+    aligner.open_gap_score = 0.0
+    aligner.extend_gap_score = 0.0
+    alignment = aligner.align(seq_a, seq_b)[0]
+    matches = sum(a == b for a, b in zip(*alignment))
+    return matches / max(1, alignment.length)
 
 
 def greedy_cluster(records: Iterable[SeqIO.SeqRecord], identity: float) -> ClusterResult:
