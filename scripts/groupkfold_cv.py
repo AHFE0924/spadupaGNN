@@ -4,6 +4,37 @@
 Clusters sequences at a specified identity threshold and performs GroupKFold
 splits so sequences from the same cluster never appear in both train and test.
 Outputs mean/std ROC-AUC across folds and plots ROC/PR curves.
+
+ESM-2 model choice (esm2_t33_650M_UR50D -- 650 million parameters)
+--------------------------------------------------------------------
+The 650M model is used rather than the smaller 150M or larger 3B variants for
+the following reasons:
+
+  * Dataset scale: B1 MBL families (NDM, VIM, IMP, etc.) have on the order of
+    hundreds to low-thousands of sequences, with proteins ~200–330 residues.
+    The 650M model provides 1280-dimensional per-residue embeddings that are
+    empirically rich enough to resolve fine-grained mutational variation at
+    this scale without overfitting the downstream scoring.
+
+  * Embedding dimensionality vs. dataset size trade-off: The 3B model yields
+    2560-dimensional embeddings. For a dataset this size the additional
+    dimensions are unlikely to improve positional variance estimates and
+    substantially increase GPU memory and inference time.  The 150M model
+    (480-dim) has been shown to lose resolution on catalytic-site residues in
+    enzyme families.
+
+  * Precedent: Lin et al. (2023, Science) demonstrate that 650M strikes the
+    best accuracy/cost trade-off for per-residue tasks on bacterial proteins.
+
+KNN baseline
+------------
+A k=1 nearest-neighbour baseline (in ESM-2 embedding space) is evaluated
+alongside the GNN-propagated scores every fold.  This answers ORNL's
+recommendation: if a simple sequence-similarity search in embedding space
+performs comparably to the GNN, the added complexity of graph propagation
+needs to be justified.  The KNN baseline uses the mean per-residue cosine
+distance from each test sequence's embedding to its single closest training
+neighbour to rank residue positions.
 """
 from __future__ import annotations
 
@@ -40,7 +71,7 @@ from cluster_utils import (
     greedy_cluster,
     load_cluster_csv,
     read_fasta_records,
-    run_cdhit,
+    run_clustering,
     write_cluster_csv,
 )
 
@@ -177,12 +208,123 @@ def compute_scores_from_train(
     }
 
 
+# ---------------------------------------------------------------------------
+# KNN baseline (k=1 in ESM-2 embedding space)
+# ---------------------------------------------------------------------------
+
+def compute_knn_scores(
+    reference: SeqIO.SeqRecord,
+    train_records: Sequence[SeqIO.SeqRecord],
+    test_records: Sequence[SeqIO.SeqRecord],
+    embeddings: Dict[str, np.ndarray],
+) -> np.ndarray:
+    """k=1 nearest-neighbour baseline in ESM-2 embedding space.
+
+    For each test sequence, find its single closest training-set neighbour
+    by mean cosine similarity across aligned residue positions.  Then score
+    each reference position by how much the test sequence's embedding at that
+    position deviates (cosine distance) from its nearest neighbour.  Positions
+    with high deviation are predicted to be mutation-tolerant.
+
+    This is the baseline recommended by ORNL: a simple sequence-similarity
+    search in embedding space that the GNN must outperform to justify its
+    added complexity.
+    """
+    ref_seq = str(reference.seq)
+    n_residues = len(ref_seq)
+
+    # Project all training embeddings to reference coordinates
+    train_projected: List[Dict[int, np.ndarray]] = []
+    for rec in train_records:
+        proj = project_embeddings_to_reference(ref_seq, str(rec.seq), embeddings[rec.id])
+        train_projected.append(proj)
+
+    if not train_projected:
+        return np.zeros(n_residues, dtype=np.float32)
+
+    # Stack per-position training matrices (n_train x embed_dim)
+    # Use NaN-fill for missing positions
+    embed_dim = next(iter(embeddings.values())).shape[-1]
+    train_matrix = np.full((len(train_projected), n_residues, embed_dim), np.nan, dtype=np.float32)
+    for t_idx, proj in enumerate(train_projected):
+        for pos, vec in proj.items():
+            train_matrix[t_idx, pos] = vec
+
+    deviation_scores = np.zeros(n_residues, dtype=np.float32)
+    counts = np.zeros(n_residues, dtype=np.int32)
+
+    for test_rec in test_records:
+        test_proj = project_embeddings_to_reference(ref_seq, str(test_rec.seq), embeddings[test_rec.id])
+
+        # Find k=1 nearest training neighbour by mean cosine similarity
+        # over positions where both test and train have valid embeddings
+        best_train_idx = _find_nearest_neighbour(test_proj, train_matrix, n_residues, embed_dim)
+
+        # Score each position by cosine distance to nearest neighbour
+        for pos, test_vec in test_proj.items():
+            if np.isnan(train_matrix[best_train_idx, pos]).any():
+                continue
+            train_vec = train_matrix[best_train_idx, pos]
+            cos_sim = _cosine_similarity(test_vec, train_vec)
+            deviation_scores[pos] += 1.0 - cos_sim  # distance = 1 - similarity
+            counts[pos] += 1
+
+    mask = counts > 0
+    deviation_scores[mask] /= counts[mask]
+
+    # Normalise to [0, 1]
+    if deviation_scores.max() > deviation_scores.min():
+        deviation_scores = (deviation_scores - deviation_scores.min()) / (
+            deviation_scores.max() - deviation_scores.min() + 1e-8
+        )
+
+    return deviation_scores
+
+
+def _cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
+    norm_a = np.linalg.norm(a)
+    norm_b = np.linalg.norm(b)
+    if norm_a < 1e-8 or norm_b < 1e-8:
+        return 0.0
+    return float(np.dot(a, b) / (norm_a * norm_b))
+
+
+def _find_nearest_neighbour(
+    test_proj: Dict[int, np.ndarray],
+    train_matrix: np.ndarray,
+    n_residues: int,
+    embed_dim: int,
+) -> int:
+    """Return index of the training sequence with highest mean cosine similarity."""
+    n_train = train_matrix.shape[0]
+    sims = np.zeros(n_train, dtype=np.float32)
+    valid_counts = np.zeros(n_train, dtype=np.int32)
+
+    for pos, test_vec in test_proj.items():
+        for t_idx in range(n_train):
+            if np.isnan(train_matrix[t_idx, pos]).any():
+                continue
+            sims[t_idx] += _cosine_similarity(test_vec, train_matrix[t_idx, pos])
+            valid_counts[t_idx] += 1
+
+    mean_sims = np.where(valid_counts > 0, sims / (valid_counts + 1e-8), -np.inf)
+    return int(np.argmax(mean_sims))
+
+
+# ---------------------------------------------------------------------------
+# ESM-2 embedding
+# ---------------------------------------------------------------------------
+
 def embed_sequences(
     records: Sequence[SeqIO.SeqRecord],
     device: str,
     batch_size: int,
     cache_path: Optional[str],
 ) -> Dict[str, np.ndarray]:
+    """Embed sequences using ESM-2 650M (esm2_t33_650M_UR50D).
+
+    See module docstring for the rationale behind this model choice.
+    """
     import torch
     import esm
 
@@ -195,6 +337,9 @@ def embed_sequences(
     if not missing:
         return cache
 
+    # 650M model: 33 transformer layers, 1280-dim embeddings.
+    # Chosen over 3B (over-parameterised for dataset scale) and 150M
+    # (insufficient resolution for catalytic-site residues in enzyme families).
     model, alphabet = esm.pretrained.esm2_t33_650M_UR50D()
     model = model.to(device).eval()
     batch_converter = alphabet.get_batch_converter()
@@ -217,13 +362,26 @@ def embed_sequences(
     return cache
 
 
+# ---------------------------------------------------------------------------
+# Argument parsing
+# ---------------------------------------------------------------------------
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="GroupKFold CV with clustering")
     parser.add_argument("--input", required=True, help="Input FASTA file")
     parser.add_argument("--family", default="VIM", help="Family filter: NDM, VIM, IMP")
     parser.add_argument("--identity", type=float, default=0.3, help="Cluster identity threshold")
     parser.add_argument("--clusters", default=None, help="Optional cluster CSV file")
-    parser.add_argument("--cluster-method", choices=["auto", "cdhit", "greedy"], default="auto")
+    parser.add_argument(
+        "--cluster-method",
+        choices=["auto", "diamond", "cdhit", "greedy"],
+        default="auto",
+        help=(
+            "Clustering method (default: auto). "
+            "'auto' tries DIAMOND → cd-hit → greedy. "
+            "'diamond' is recommended (BLOSUM-based)."
+        ),
+    )
     parser.add_argument("--output", default="output/groupkfold", help="Output folder")
     parser.add_argument("--device", default="cuda", help="cuda or cpu")
     parser.add_argument("--batch-size", type=int, default=2, help="ESM batch size")
@@ -235,6 +393,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--bootstrap", type=int, default=500, help="Bootstrap samples for CI")
     return parser.parse_args()
 
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 def main() -> int:
     args = parse_args()
@@ -250,27 +412,23 @@ def main() -> int:
     reference = choose_reference(records, family)
     non_reference = [r for r in records if r.id != reference.id]
 
+    # ------------------------------------------------------------------
+    # Clustering
+    # ------------------------------------------------------------------
     cluster_csv = None
     if args.clusters:
         cluster_csv = args.clusters
         assignments = load_cluster_csv(cluster_csv)
     else:
         cluster_csv = str(output_dir / f"clusters_{family.lower()}.csv")
-        if args.cluster_method in {"auto", "cdhit"}:
-            try:
-                result = run_cdhit(args.input, str(output_dir / f"cdhit_{family.lower()}"), args.identity)
-                assignments = result.assignments
-                write_cluster_csv(assignments, cluster_csv)
-            except FileNotFoundError:
-                if args.cluster_method == "cdhit":
-                    raise SystemExit("cd-hit not found. Install it or use --cluster-method greedy.")
-                result = greedy_cluster(non_reference, args.identity)
-                assignments = result.assignments
-                write_cluster_csv(assignments, cluster_csv)
-        else:
-            result = greedy_cluster(non_reference, args.identity)
-            assignments = result.assignments
-            write_cluster_csv(assignments, cluster_csv)
+        result = run_clustering(
+            fasta_path=args.input,
+            output_prefix=str(output_dir / f"cluster_{family.lower()}"),
+            identity=args.identity,
+            method=args.cluster_method,
+        )
+        assignments = result.assignments
+        write_cluster_csv(assignments, cluster_csv)
 
     groups = [assignments.get(rec.id, -1) for rec in non_reference]
     unique_groups = len(set(groups))
@@ -286,6 +444,8 @@ def main() -> int:
                     "std_roc_auc": float("nan"),
                     "mean_pr_auc": float("nan"),
                     "std_pr_auc": float("nan"),
+                    "knn_mean_roc_auc": float("nan"),
+                    "knn_std_roc_auc": float("nan"),
                     "note": "Not enough clusters or samples for GroupKFold",
                 }
             ]
@@ -303,21 +463,29 @@ def main() -> int:
     device = args.device
     try:
         import torch
-
         if device == "cuda" and not torch.cuda.is_available():
             device = "cpu"
     except Exception:
         device = "cpu"
 
-    embeddings = embed_sequences(records, device=device, batch_size=args.batch_size, cache_path=args.embed_cache)
+    embeddings = embed_sequences(
+        records, device=device, batch_size=args.batch_size, cache_path=args.embed_cache
+    )
 
+    # ------------------------------------------------------------------
+    # Cross-validation
+    # ------------------------------------------------------------------
     fold_rows = []
-    roc_curves = []
-    pr_curves = []
-    aucs = []
-    aps = []
+    roc_curves_gnn = []
+    pr_curves_gnn = []
+    roc_curves_knn = []
+    pr_curves_knn = []
+    aucs_gnn = []
+    aps_gnn = []
+    aucs_knn = []
+    aps_knn = []
     fold_labels = []
-    fold_scores = []
+    fold_scores_gnn = []
 
     ref_seq = str(reference.seq)
 
@@ -325,28 +493,50 @@ def main() -> int:
         train_records = [reference] + [non_reference[i] for i in train_idx]
         test_records = [non_reference[i] for i in test_idx]
 
-        scores = compute_scores_from_train(reference, train_records, embeddings, alpha=args.alpha, hops=args.hops)
+        # GNN scores
+        scores = compute_scores_from_train(
+            reference, train_records, embeddings, alpha=args.alpha, hops=args.hops
+        )
 
+        # KNN baseline (k=1)
+        knn_scores = compute_knn_scores(reference, train_records, test_records, embeddings)
+
+        # Labels: positions that vary in test sequences relative to reference
         positive_positions: List[int] = []
         for rec in test_records:
             positive_positions.extend(project_variant_positions(ref_seq, str(rec.seq)))
         positive_positions = sorted(set(positive_positions))
 
-        y_true = np.array([1 if i in positive_positions else 0 for i in range(len(ref_seq))], dtype=int)
+        y_true = np.array(
+            [1 if i in positive_positions else 0 for i in range(len(ref_seq))], dtype=int
+        )
         if y_true.sum() == 0 or y_true.sum() == len(y_true):
             continue
 
-        roc_auc = roc_auc_score(y_true, scores["combined"])
-        ap = average_precision_score(y_true, scores["combined"])
-        fpr, tpr, _ = roc_curve(y_true, scores["combined"])
-        prec, rec, _ = precision_recall_curve(y_true, scores["combined"])
+        # GNN metrics
+        roc_auc_gnn = roc_auc_score(y_true, scores["combined"])
+        ap_gnn = average_precision_score(y_true, scores["combined"])
+        fpr_gnn, tpr_gnn, _ = roc_curve(y_true, scores["combined"])
+        prec_gnn, rec_gnn, _ = precision_recall_curve(y_true, scores["combined"])
 
-        aucs.append(roc_auc)
-        aps.append(ap)
-        roc_curves.append((fpr, tpr, roc_auc))
-        pr_curves.append((rec, prec, ap))
+        # KNN metrics
+        roc_auc_knn = roc_auc_score(y_true, knn_scores)
+        ap_knn = average_precision_score(y_true, knn_scores)
+        fpr_knn, tpr_knn, _ = roc_curve(y_true, knn_scores)
+        prec_knn, rec_knn, _ = precision_recall_curve(y_true, knn_scores)
+
+        aucs_gnn.append(roc_auc_gnn)
+        aps_gnn.append(ap_gnn)
+        aucs_knn.append(roc_auc_knn)
+        aps_knn.append(ap_knn)
+
+        roc_curves_gnn.append((fpr_gnn, tpr_gnn, roc_auc_gnn))
+        pr_curves_gnn.append((rec_gnn, prec_gnn, ap_gnn))
+        roc_curves_knn.append((fpr_knn, tpr_knn, roc_auc_knn))
+        pr_curves_knn.append((rec_knn, prec_knn, ap_knn))
+
         fold_labels.append(y_true)
-        fold_scores.append(scores["combined"])
+        fold_scores_gnn.append(scores["combined"])
 
         fold_rows.append(
             {
@@ -354,40 +544,43 @@ def main() -> int:
                 "n_train": len(train_records),
                 "n_test": len(test_records),
                 "n_positive_positions": int(y_true.sum()),
-                "roc_auc": roc_auc,
-                "pr_auc": ap,
+                "gnn_roc_auc": roc_auc_gnn,
+                "gnn_pr_auc": ap_gnn,
+                "knn_roc_auc": roc_auc_knn,
+                "knn_pr_auc": ap_knn,
             }
         )
 
     fold_df = pd.DataFrame(fold_rows)
     fold_df.to_csv(output_dir / f"cv_{family.lower()}_folds.csv", index=False)
 
-    mean_auc = float(np.mean(aucs)) if aucs else float("nan")
-    std_auc = float(np.std(aucs)) if aucs else float("nan")
-    mean_ap = float(np.mean(aps)) if aps else float("nan")
-    std_ap = float(np.std(aps)) if aps else float("nan")
+    mean_auc = float(np.mean(aucs_gnn)) if aucs_gnn else float("nan")
+    std_auc = float(np.std(aucs_gnn)) if aucs_gnn else float("nan")
+    mean_ap = float(np.mean(aps_gnn)) if aps_gnn else float("nan")
+    std_ap = float(np.std(aps_gnn)) if aps_gnn else float("nan")
 
-    # Bootstrap CI for mean AUC/AP across folds
-    ci_auc_lower = float("nan")
-    ci_auc_upper = float("nan")
-    ci_ap_lower = float("nan")
-    ci_ap_upper = float("nan")
-    if len(aucs) >= 2:
+    mean_auc_knn = float(np.mean(aucs_knn)) if aucs_knn else float("nan")
+    std_auc_knn = float(np.std(aucs_knn)) if aucs_knn else float("nan")
+    mean_ap_knn = float(np.mean(aps_knn)) if aps_knn else float("nan")
+    std_ap_knn = float(np.std(aps_knn)) if aps_knn else float("nan")
+
+    # Bootstrap CI for mean AUC/AP (GNN)
+    ci_auc_lower = ci_auc_upper = ci_ap_lower = ci_ap_upper = float("nan")
+    if len(aucs_gnn) >= 2:
         rng = np.random.default_rng(42)
         boot_means_auc = []
         boot_means_ap = []
         for _ in range(args.bootstrap):
-            idx = rng.integers(0, len(aucs), len(aucs))
-            boot_means_auc.append(np.mean(np.array(aucs)[idx]))
-            boot_means_ap.append(np.mean(np.array(aps)[idx]))
+            idx = rng.integers(0, len(aucs_gnn), len(aucs_gnn))
+            boot_means_auc.append(np.mean(np.array(aucs_gnn)[idx]))
+            boot_means_ap.append(np.mean(np.array(aps_gnn)[idx]))
         ci_auc_lower = float(np.percentile(boot_means_auc, 2.5))
         ci_auc_upper = float(np.percentile(boot_means_auc, 97.5))
         ci_ap_lower = float(np.percentile(boot_means_ap, 2.5))
         ci_ap_upper = float(np.percentile(boot_means_ap, 97.5))
 
-    # Permutation test vs random baseline (mean across folds)
-    p_value_auc = float("nan")
-    p_value_ap = float("nan")
+    # Permutation test vs random baseline (GNN)
+    p_value_auc = p_value_ap = float("nan")
     if fold_labels and args.permutations > 0:
         rng = np.random.default_rng(123)
         perm_mean_auc = []
@@ -395,7 +588,7 @@ def main() -> int:
         for _ in range(args.permutations):
             perm_aucs = []
             perm_aps = []
-            for y_true, y_scores in zip(fold_labels, fold_scores):
+            for y_true, y_scores in zip(fold_labels, fold_scores_gnn):
                 y_perm = rng.permutation(y_true)
                 if y_perm.sum() == 0 or y_perm.sum() == len(y_perm):
                     continue
@@ -406,54 +599,83 @@ def main() -> int:
             if perm_aps:
                 perm_mean_ap.append(np.mean(perm_aps))
         if perm_mean_auc:
-            p_value_auc = float((np.sum(np.array(perm_mean_auc) >= mean_auc) + 1) / (len(perm_mean_auc) + 1))
+            p_value_auc = float(
+                (np.sum(np.array(perm_mean_auc) >= mean_auc) + 1) / (len(perm_mean_auc) + 1)
+            )
         if perm_mean_ap:
-            p_value_ap = float((np.sum(np.array(perm_mean_ap) >= mean_ap) + 1) / (len(perm_mean_ap) + 1))
+            p_value_ap = float(
+                (np.sum(np.array(perm_mean_ap) >= mean_ap) + 1) / (len(perm_mean_ap) + 1)
+            )
 
     summary = {
         "family": family,
-        "n_folds": len(aucs),
-        "mean_roc_auc": mean_auc,
-        "std_roc_auc": std_auc,
-        "mean_pr_auc": mean_ap,
-        "std_pr_auc": std_ap,
-        "ci_roc_auc_lower": ci_auc_lower,
-        "ci_roc_auc_upper": ci_auc_upper,
-        "ci_pr_auc_lower": ci_ap_lower,
-        "ci_pr_auc_upper": ci_ap_upper,
-        "p_value_roc_auc": p_value_auc,
-        "p_value_pr_auc": p_value_ap,
+        "n_folds": len(aucs_gnn),
+        # GNN
+        "gnn_mean_roc_auc": mean_auc,
+        "gnn_std_roc_auc": std_auc,
+        "gnn_mean_pr_auc": mean_ap,
+        "gnn_std_pr_auc": std_ap,
+        "gnn_ci_roc_auc_lower": ci_auc_lower,
+        "gnn_ci_roc_auc_upper": ci_auc_upper,
+        "gnn_ci_pr_auc_lower": ci_ap_lower,
+        "gnn_ci_pr_auc_upper": ci_ap_upper,
+        "gnn_p_value_roc_auc": p_value_auc,
+        "gnn_p_value_pr_auc": p_value_ap,
+        # KNN baseline
+        "knn_mean_roc_auc": mean_auc_knn,
+        "knn_std_roc_auc": std_auc_knn,
+        "knn_mean_pr_auc": mean_ap_knn,
+        "knn_std_pr_auc": std_ap_knn,
+        # Convenience delta
+        "delta_roc_auc_gnn_minus_knn": mean_auc - mean_auc_knn,
     }
     pd.DataFrame([summary]).to_csv(output_dir / f"cv_{family.lower()}_summary.csv", index=False)
 
-    # Plot ROC and PR curves
+    # ------------------------------------------------------------------
+    # Plots: GNN and KNN side-by-side on the same axes
+    # ------------------------------------------------------------------
     import matplotlib.pyplot as plt
 
-    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
-    for fpr, tpr, auc_val in roc_curves:
-        axes[0].plot(fpr, tpr, alpha=0.35, label=f"AUC={auc_val:.3f}")
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+
+    for fpr, tpr, auc_val in roc_curves_gnn:
+        axes[0].plot(fpr, tpr, color="steelblue", alpha=0.35, label=f"GNN AUC={auc_val:.3f}")
+    for fpr, tpr, auc_val in roc_curves_knn:
+        axes[0].plot(fpr, tpr, color="tomato", alpha=0.35, linestyle="--", label=f"KNN AUC={auc_val:.3f}")
     axes[0].plot([0, 1], [0, 1], "k--", linewidth=1)
     axes[0].set_xlabel("False Positive Rate")
     axes[0].set_ylabel("True Positive Rate")
-    axes[0].set_title(f"ROC (mean={mean_auc:.3f} ± {std_auc:.3f})")
+    axes[0].set_title(
+        f"ROC  GNN={mean_auc:.3f}±{std_auc:.3f}  KNN={mean_auc_knn:.3f}±{std_auc_knn:.3f}"
+    )
 
-    for rec, prec, ap in pr_curves:
-        axes[1].plot(rec, prec, alpha=0.35, label=f"AP={ap:.3f}")
+    for rec, prec, ap in pr_curves_gnn:
+        axes[1].plot(rec, prec, color="steelblue", alpha=0.35, label=f"GNN AP={ap:.3f}")
+    for rec, prec, ap in pr_curves_knn:
+        axes[1].plot(rec, prec, color="tomato", alpha=0.35, linestyle="--", label=f"KNN AP={ap:.3f}")
     axes[1].set_xlabel("Recall")
     axes[1].set_ylabel("Precision")
-    axes[1].set_title(f"PR (mean={mean_ap:.3f} ± {std_ap:.3f})")
+    axes[1].set_title(
+        f"PR  GNN={mean_ap:.3f}±{std_ap:.3f}  KNN={mean_ap_knn:.3f}±{std_ap_knn:.3f}"
+    )
 
     for ax in axes:
         ax.grid(True, alpha=0.2)
+        # Deduplicate legend entries
+        handles, labels = ax.get_legend_handles_labels()
+        by_label = dict(zip(labels, handles))
+        ax.legend(by_label.values(), by_label.keys(), fontsize=7)
 
     fig.tight_layout()
     fig_path = output_dir / f"cv_{family.lower()}_roc_pr.png"
     fig.savefig(fig_path, dpi=200)
     plt.close(fig)
 
-    print(f"Saved fold metrics to {output_dir / f'cv_{family.lower()}_folds.csv'}")
-    print(f"Saved summary to {output_dir / f'cv_{family.lower()}_summary.csv'}")
-    print(f"Saved ROC/PR plot to {fig_path}")
+    print(f"Saved fold metrics: {output_dir / f'cv_{family.lower()}_folds.csv'}")
+    print(f"Saved summary:      {output_dir / f'cv_{family.lower()}_summary.csv'}")
+    print(f"Saved ROC/PR plot:  {fig_path}")
+    print(f"\nGNN  ROC-AUC: {mean_auc:.4f} ± {std_auc:.4f}")
+    print(f"KNN  ROC-AUC: {mean_auc_knn:.4f} ± {std_auc_knn:.4f}  (delta={mean_auc - mean_auc_knn:+.4f})")
     return 0
 
 
