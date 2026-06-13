@@ -156,7 +156,8 @@ def build_query(families: List[str], reviewed: bool, taxon: Optional[str]) -> st
     return query
 
 
-def fetch_fasta(query: str, output_path: Path) -> None:
+def fetch_fasta(query: str, output_path: Path, retries: int = 5, backoff: float = 10.0) -> None:
+    import time
     base = "https://rest.uniprot.org/uniprotkb/stream"
     params = {
         "format": "fasta",
@@ -164,8 +165,17 @@ def fetch_fasta(query: str, output_path: Path) -> None:
     }
     url = f"{base}?{urllib.parse.urlencode(params)}"
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    with urllib.request.urlopen(url) as response, output_path.open("wb") as handle:
-        handle.write(response.read())
+    for attempt in range(1, retries + 1):
+        try:
+            with urllib.request.urlopen(url, timeout=120) as response, output_path.open("wb") as handle:
+                handle.write(response.read())
+            return
+        except Exception as exc:
+            if attempt == retries:
+                raise
+            wait = backoff * attempt
+            print(f"Fetch attempt {attempt} failed ({exc}). Retrying in {wait:.0f}s...")
+            time.sleep(wait)
 
 
 def family_from_header(header: str, families: List[str]) -> Optional[str]:
