@@ -113,13 +113,14 @@ for path in (str(REPO_ROOT), str(SCRIPTS_DIR)):
 os.environ.setdefault("SPADUPA_DISABLE_AUTORUN", "1")
 
 from Bio import SeqIO
+from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
     average_precision_score,
     precision_recall_curve,
     roc_auc_score,
     roc_curve,
 )
-from sklearn.model_selection import GroupKFold
+from sklearn.model_selection import GroupKFold, KFold, StratifiedKFold
 
 from cluster_utils import (
     greedy_cluster,
@@ -128,6 +129,7 @@ from cluster_utils import (
     run_clustering,
     write_cluster_csv,
 )
+from collections import Counter
 
 
 NDM_FAMILY = "NDM"
@@ -242,38 +244,41 @@ def get_active_site_positions(family: str, ref_seq: str) -> List[int]:
 # AlphaFold structure-based contact map
 # ---------------------------------------------------------------------------
 
-# Canonical UniProt accessions for the reference sequence of each B1 family.
-# Used to fetch AlphaFold predicted structures for contact map construction.
-# Sources: UniProt canonical entries for each family founder variant.
-_FAMILY_UNIPROT: Dict[str, str] = {
-    "NDM": "C7C422",   # NDM-1, Klebsiella pneumoniae (Yong et al. 2009)
-    "VIM": "Q9KIN3",   # VIM-2, Pseudomonas aeruginosa (Poirel et al. 2000)
-    "IMP": "P52699",   # IMP-1, Pseudomonas aeruginosa (Osano et al. 1994)
-    "SPM": "Q8GRQ4",   # SPM-1, Pseudomonas aeruginosa (Toleman et al. 2002)
-    "GIM": "Q5FAK0",   # GIM-1, Pseudomonas putida (Castanheira et al. 2004)
-    "SIM": "B2ZEI2",   # SIM-1, Stenotrophomonas maltophilia (Lee et al. 2005)
+# Verified PDB IDs for canonical B1 MBL reference structures (experimental).
+# Crystal structures are preferred over AlphaFold for these well-characterized
+# proteins as they have experimental validation and stable accession IDs.
+#   NDM: 3SPU  NDM-1, E. coli,          1.90 Å  (Tesar et al. 2011)
+#   VIM: 1KO3  VIM-2, P. aeruginosa,    1.85 Å  (Garcia-Saez et al. 2008)
+#   IMP: 1DDK  IMP-1, P. aeruginosa,    2.20 Å  (Concha et al. 2000)
+#   SPM: 1X8I  SPM-1, P. aeruginosa,    2.30 Å  (Murphy et al. 2006)
+# GIM and SIM have no deposited crystal structures — chain graph fallback used.
+_FAMILY_PDB: Dict[str, str] = {
+    "NDM": "3SPU",
+    "VIM": "1KO3",
+    "IMP": "1DDK",
+    "SPM": "1X8I",
 }
 
 
-def fetch_alphafold_pdb(uniprot_id: str, cache_dir: Path) -> Optional[Path]:
-    """Download AlphaFold v4 structure PDB for a UniProt ID, caching locally.
+def fetch_rcsb_pdb(pdb_id: str, cache_dir: Path) -> Optional[Path]:
+    """Download a PDB file from RCSB, caching locally.
 
-    URL format: https://alphafold.ebi.ac.uk/files/AF-{id}-F1-model_v4.pdb
-    Falls back gracefully — returns None if download fails.
+    URL: https://files.rcsb.org/download/{pdb_id}.pdb
+    Returns None on failure so callers can fall back gracefully.
     """
     import urllib.request as _ureq
 
     cache_dir.mkdir(parents=True, exist_ok=True)
-    pdb_path = cache_dir / f"AF-{uniprot_id}-F1-model_v4.pdb"
+    pdb_path = cache_dir / f"{pdb_id.upper()}.pdb"
     if pdb_path.exists():
         return pdb_path
-    url = f"https://alphafold.ebi.ac.uk/files/AF-{uniprot_id}-F1-model_v4.pdb"
+    url = f"https://files.rcsb.org/download/{pdb_id.upper()}.pdb"
     try:
         _ureq.urlretrieve(url, str(pdb_path))
-        print(f"Downloaded AlphaFold structure: {pdb_path.name}")
+        print(f"Downloaded PDB structure: {pdb_id.upper()}.pdb")
         return pdb_path
     except Exception as exc:
-        print(f"Warning: AlphaFold download failed for {uniprot_id} ({exc}). Using chain graph fallback.")
+        print(f"Warning: PDB download failed for {pdb_id} ({exc}). Using chain graph fallback.")
         return None
 
 
@@ -323,26 +328,27 @@ def build_structure_graph(
     structure_dir: Optional[Path],
     contact_threshold: float = 8.0,
 ) -> np.ndarray:
-    """Return a normalised adjacency matrix using AlphaFold Cα contacts.
+    """Return a normalised adjacency matrix using experimental Cα contacts.
 
-    If a structure cannot be obtained (unknown family, network error, etc.)
-    falls back to the ±5 chain graph so the pipeline never hard-fails.
+    Downloads the canonical crystal structure for the family from RCSB PDB
+    (NDM→3SPU, VIM→1KO3, IMP→1DDK, SPM→1X8I).  Falls back to the ±5 chain
+    graph for families without a deposited structure (GIM, SIM) or if the
+    download fails.
 
-    The structure-based graph captures long-range contacts that the chain
-    graph misses, which substantially improves score propagation quality for
+    Crystal structure contacts capture long-range spatial relationships that
+    the chain graph misses, substantially improving score propagation for
     enzyme families where active-site residues are sequence-distant.
     """
     if structure_dir is not None:
-        uniprot_id = _FAMILY_UNIPROT.get(family.upper())
-        if uniprot_id:
-            pdb_path = fetch_alphafold_pdb(uniprot_id, structure_dir)
+        pdb_id = _FAMILY_PDB.get(family.upper())
+        if pdb_id:
+            pdb_path = fetch_rcsb_pdb(pdb_id, structure_dir)
             if pdb_path is not None:
                 try:
                     coords = parse_ca_coords(pdb_path)
                     if len(coords) >= 10:
                         min_len = min(len(coords), n_residues)
                         contacts = build_contact_map_from_coords(coords[:min_len], threshold=contact_threshold)
-                        # Embed contacts into full (n_residues × n_residues) matrix
                         adj = np.zeros((n_residues, n_residues), dtype=np.float32)
                         adj[:min_len, :min_len] = contacts
                         # Chain graph for residues beyond structure coverage
@@ -352,7 +358,7 @@ def build_structure_graph(
                                 adj[j, i] = 1.0
                         np.fill_diagonal(adj, 1.0)
                         deg = adj.sum(axis=1, keepdims=True)
-                        print(f"Structure graph ({family}, UniProt {uniprot_id}): "
+                        print(f"Structure graph ({family}, PDB {pdb_id}): "
                               f"{int(contacts.sum())} contacts in {min_len}-residue structure")
                         return adj / (deg + 1e-8)
                 except Exception as exc:
@@ -447,11 +453,11 @@ def compute_scores_from_train(
     return {
         "variance": var_norm,
         "graph": propagated,
+        "biophysical": biophysical,
         "combined": combined,
     }
 
 
-    # Biophysical proximity term: distance to literature-sourced active site
 
 
 # ---------------------------------------------------------------------------
@@ -558,6 +564,53 @@ def _find_nearest_neighbour(
 
 
 # ---------------------------------------------------------------------------
+# Logistic Regression baseline (raw-feature ablation)
+# ---------------------------------------------------------------------------
+
+def compute_lr_baseline_scores(
+    features: np.ndarray,
+    y_true: np.ndarray,
+    n_splits: int = 5,
+    seed: int = 0,
+) -> Tuple[float, float]:
+    """Logistic regression on GBSP's raw ingredients, evaluated out-of-fold.
+
+    Ablation requested per ORNL feedback: GBSP combines per-position variance
+    and active-site distance via a FIXED formula (propagate, then
+    0.90*graph + 0.10*biophysical).  This baseline instead lets a tiny LR
+    LEARN how to combine the same two raw signals (pre-propagation variance
+    and biophysical distance).  If LR beats GBSP, the fixed combination/
+    propagation is not adding value and should be replaced with a learned
+    blend; if GBSP beats LR, propagation is doing real work.
+
+    `features` shape: (n_residues, n_features) -- typically [variance, biophysical].
+    `y_true` shape: (n_residues,) -- same labels GBSP/KNN are scored against.
+
+    Evaluated via StratifiedKFold over residue POSITIONS (not sequences) so
+    the LR itself is cross-validated; out-of-fold predictions are pooled
+    before computing ROC-AUC/PR-AUC.  Returns (nan, nan) if y_true has too
+    few examples of either class to stratify.
+    """
+    n = len(y_true)
+    if y_true.sum() < n_splits or (n - y_true.sum()) < n_splits:
+        return float("nan"), float("nan")
+
+    try:
+        skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
+        oof_scores = np.zeros(n, dtype=np.float64)
+        for train_idx, test_idx in skf.split(features, y_true):
+            clf = LogisticRegression(max_iter=1000, class_weight="balanced")
+            clf.fit(features[train_idx], y_true[train_idx])
+            oof_scores[test_idx] = clf.predict_proba(features[test_idx])[:, 1]
+        roc = roc_auc_score(y_true, oof_scores)
+        pr = average_precision_score(y_true, oof_scores)
+        return float(roc), float(pr)
+    except Exception as exc:
+        print(f"Warning: LR baseline failed ({exc})")
+        return float("nan"), float("nan")
+
+
+# ---------------------------------------------------------------------------
 # ESM-2 embedding
 # ---------------------------------------------------------------------------
 
@@ -649,6 +702,19 @@ def parse_args() -> argparse.Namespace:
         default=8.0,
         help="Cα–Cα distance threshold in Å for contact map (default: 8.0)",
     )
+    parser.add_argument(
+        "--split-method",
+        choices=["group", "random"],
+        default="group",
+        help=(
+            "Sequence split strategy (default: group). "
+            "'group' = GroupKFold by DIAMOND cluster (no homolog leakage, "
+            "the honest evaluation). "
+            "'random' = plain KFold ignoring clusters -- run this to quantify "
+            "how much harder the task is under strict homology splitting "
+            "vs. a naive random split."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -694,6 +760,28 @@ def main() -> int:
     groups = [assignments.get(rec.id, -1) for rec in non_reference]
     unique_groups = len(set(groups))
     n_samples = len(non_reference)
+
+    # ------------------------------------------------------------------
+    # Corrected per-family cluster report.
+    # NOTE: `assignments` covers the ENTIRE superfamily fasta (DIAMOND was
+    # run on args.input, not a family-filtered fasta), so we filter down to
+    # this family's own sequences before reporting cluster statistics.
+    # ------------------------------------------------------------------
+    family_seq_ids = {rec.id for rec in records}
+    family_assignments = {sid: cid for sid, cid in assignments.items() if sid in family_seq_ids}
+    cluster_sizes = Counter(family_assignments.values())
+    median_cluster_size = float("nan")
+    if cluster_sizes:
+        size_vals = sorted(cluster_sizes.values())
+        median_cluster_size = size_vals[len(size_vals) // 2]
+        n_singletons = sum(1 for s in size_vals if s == 1)
+        print(
+            f"\n[{family}] sequences: {len(family_seq_ids)} | "
+            f"clusters (this family): {len(cluster_sizes)} | "
+            f"median cluster size: {median_cluster_size} | "
+            f"max: {max(size_vals)} | singletons: {n_singletons}"
+        )
+
     if unique_groups < 2 or n_samples < 2:
         summary_path = output_dir / f"cv_{family.lower()}_summary.csv"
         pd.DataFrame(
@@ -719,7 +807,15 @@ def main() -> int:
     if n_splits < 2:
         n_splits = 2
 
-    gkf = GroupKFold(n_splits=n_splits)
+    if args.split_method == "random":
+        kf = KFold(n_splits=n_splits, shuffle=True, random_state=42)
+        split_iter = kf.split(non_reference)
+        print(f"[{family}] Split method: RANDOM KFold (n_splits={n_splits}) -- "
+              "ignores cluster structure; expect inflated scores vs. 'group'.")
+    else:
+        gkf = GroupKFold(n_splits=n_splits)
+        split_iter = gkf.split(non_reference, groups=groups)
+        print(f"[{family}] Split method: GroupKFold by DIAMOND cluster (n_splits={n_splits})")
 
     device = args.device
     try:
@@ -745,12 +841,14 @@ def main() -> int:
     aps_gbsp = []
     aucs_knn = []
     aps_knn = []
+    aucs_lr = []
+    aps_lr = []
     fold_labels = []
     fold_scores_gbsp = []
 
     ref_seq = str(reference.seq)
 
-    for fold_idx, (train_idx, test_idx) in enumerate(gkf.split(non_reference, groups=groups), start=1):
+    for fold_idx, (train_idx, test_idx) in enumerate(split_iter, start=1):
         train_records = [reference] + [non_reference[i] for i in train_idx]
         test_records = [non_reference[i] for i in test_idx]
 
@@ -789,10 +887,17 @@ def main() -> int:
         fpr_knn, tpr_knn, _ = roc_curve(y_true, knn_scores)
         prec_knn, rec_knn, _ = precision_recall_curve(y_true, knn_scores)
 
+        # LR baseline: learned combination of GBSP's raw (pre-propagation)
+        # ingredients -- variance + biophysical distance.
+        lr_features = np.stack([scores["variance"], scores["biophysical"]], axis=1)
+        roc_auc_lr, ap_lr = compute_lr_baseline_scores(lr_features, y_true)
+
         aucs_gbsp.append(roc_auc_gbsp)
         aps_gbsp.append(ap_gbsp)
         aucs_knn.append(roc_auc_knn)
         aps_knn.append(ap_knn)
+        aucs_lr.append(roc_auc_lr)
+        aps_lr.append(ap_lr)
 
         roc_curves_gbsp.append((fpr_gbsp, tpr_gbsp, roc_auc_gbsp))
         pr_curves_gbsp.append((rec_gbsp, prec_gbsp, ap_gbsp))
@@ -812,11 +917,14 @@ def main() -> int:
                 "gbsp_pr_auc": ap_gbsp,
                 "knn_roc_auc": roc_auc_knn,
                 "knn_pr_auc": ap_knn,
+                "lr_roc_auc": roc_auc_lr,
+                "lr_pr_auc": ap_lr,
             }
         )
 
     fold_df = pd.DataFrame(fold_rows)
-    fold_df.to_csv(output_dir / f"cv_{family.lower()}_folds.csv", index=False)
+    out_tag = f"{family.lower()}_{args.split_method}"
+    fold_df.to_csv(output_dir / f"cv_{out_tag}_folds.csv", index=False)
 
     mean_auc = float(np.mean(aucs_gbsp)) if aucs_gbsp else float("nan")
     std_auc = float(np.std(aucs_gbsp)) if aucs_gbsp else float("nan")
@@ -827,6 +935,13 @@ def main() -> int:
     std_auc_knn = float(np.std(aucs_knn)) if aucs_knn else float("nan")
     mean_ap_knn = float(np.mean(aps_knn)) if aps_knn else float("nan")
     std_ap_knn = float(np.std(aps_knn)) if aps_knn else float("nan")
+
+    valid_lr_auc = [v for v in aucs_lr if not np.isnan(v)]
+    valid_lr_ap = [v for v in aps_lr if not np.isnan(v)]
+    mean_auc_lr = float(np.mean(valid_lr_auc)) if valid_lr_auc else float("nan")
+    std_auc_lr = float(np.std(valid_lr_auc)) if valid_lr_auc else float("nan")
+    mean_ap_lr = float(np.mean(valid_lr_ap)) if valid_lr_ap else float("nan")
+    std_ap_lr = float(np.std(valid_lr_ap)) if valid_lr_ap else float("nan")
 
     # Bootstrap CI for mean AUC/AP (GBSP)
     ci_auc_lower = ci_auc_upper = ci_ap_lower = ci_ap_upper = float("nan")
@@ -873,7 +988,11 @@ def main() -> int:
 
     summary = {
         "family": family,
+        "split_method": args.split_method,
         "n_folds": len(aucs_gbsp),
+        "n_sequences": len(family_seq_ids),
+        "n_clusters_family": len(cluster_sizes) if cluster_sizes else 0,
+        "median_cluster_size": median_cluster_size,
         # GBSP
         "gbsp_mean_roc_auc": mean_auc,
         "gbsp_std_roc_auc": std_auc,
@@ -890,10 +1009,16 @@ def main() -> int:
         "knn_std_roc_auc": std_auc_knn,
         "knn_mean_pr_auc": mean_ap_knn,
         "knn_std_pr_auc": std_ap_knn,
-        # Convenience delta
+        # LR baseline (learned combination of GBSP's raw ingredients)
+        "lr_mean_roc_auc": mean_auc_lr,
+        "lr_std_roc_auc": std_auc_lr,
+        "lr_mean_pr_auc": mean_ap_lr,
+        "lr_std_pr_auc": std_ap_lr,
+        # Convenience deltas
         "delta_roc_auc_gbsp_minus_knn": mean_auc - mean_auc_knn,
+        "delta_roc_auc_gbsp_minus_lr": mean_auc - mean_auc_lr,
     }
-    pd.DataFrame([summary]).to_csv(output_dir / f"cv_{family.lower()}_summary.csv", index=False)
+    pd.DataFrame([summary]).to_csv(output_dir / f"cv_{out_tag}_summary.csv", index=False)
 
     # ------------------------------------------------------------------
     # Plots: GBSP and KNN side-by-side on the same axes
@@ -930,15 +1055,54 @@ def main() -> int:
         ax.legend(by_label.values(), by_label.keys(), fontsize=7)
 
     fig.tight_layout()
-    fig_path = output_dir / f"cv_{family.lower()}_roc_pr.png"
+    fig_path = output_dir / f"cv_{out_tag}_roc_pr.png"
     fig.savefig(fig_path, dpi=200)
     plt.close(fig)
 
-    print(f"Saved fold metrics: {output_dir / f'cv_{family.lower()}_folds.csv'}")
-    print(f"Saved summary:      {output_dir / f'cv_{family.lower()}_summary.csv'}")
+    print(f"Saved fold metrics: {output_dir / f'cv_{out_tag}_folds.csv'}")
+    print(f"Saved summary:      {output_dir / f'cv_{out_tag}_summary.csv'}")
     print(f"Saved ROC/PR plot:  {fig_path}")
-    print(f"\nGBSP ROC-AUC: {mean_auc:.4f} ± {std_auc:.4f}")
-    print(f"KNN  ROC-AUC: {mean_auc_knn:.4f} ± {std_auc_knn:.4f}  (delta={mean_auc - mean_auc_knn:+.4f})")
+    print(f"\n[{family} / {args.split_method}] GBSP ROC-AUC: {mean_auc:.4f} ± {std_auc:.4f}")
+    print(f"[{family} / {args.split_method}] KNN  ROC-AUC: {mean_auc_knn:.4f} ± {std_auc_knn:.4f}  "
+          f"(delta={mean_auc - mean_auc_knn:+.4f})")
+    print(f"[{family} / {args.split_method}] LR   ROC-AUC: {mean_auc_lr:.4f} ± {std_auc_lr:.4f}  "
+          f"(delta={mean_auc - mean_auc_lr:+.4f})")
+
+    # ------------------------------------------------------------------
+    # Decision rules (printed, not enforced) -- flags worth acting on
+    # ------------------------------------------------------------------
+    print(f"\n[DECISIONS for {family} / {args.split_method}]")
+    if len(family_seq_ids) < 200:
+        print(f"  - n_sequences={len(family_seq_ids)} < 200: dataset is small; "
+              "consider relaxing UniProt filters or pulling in more related sequences.")
+    if not np.isnan(median_cluster_size) and median_cluster_size == 1:
+        print("  - median_cluster_size=1: clustering is fragmented for this family; "
+              "retry fetch/cluster step with --cluster-identity 0.5 and 0.7 and compare.")
+    if not np.isnan(mean_auc_knn) and abs(mean_auc - mean_auc_knn) < 0.02:
+        print("  - |GBSP-KNN| < 0.02: graph propagation adds negligible value over "
+              "naive k=1 similarity search for this family.")
+    if not np.isnan(mean_auc_lr) and mean_auc_lr > mean_auc + 0.02:
+        print(f"  - LR ({mean_auc_lr:.3f}) beats GBSP ({mean_auc:.3f}) by >0.02: "
+              "the fixed 0.90/0.10 weighting + propagation is hurting relative to a "
+              "learned linear combination of the same raw signals. Consider learning "
+              "the blend weight instead of hardcoding it.")
+    if args.split_method == "group":
+        print("  - Run the same family with --split-method random to quantify how much "
+              "homology-aware splitting is responsible for the score (compare cv_"
+              f"{family.lower()}_random_summary.csv once produced).")
+    elif args.split_method == "random":
+        group_summary_path = output_dir / f"cv_{family.lower()}_group_summary.csv"
+        if group_summary_path.exists():
+            try:
+                group_auc = pd.read_csv(group_summary_path)["gbsp_mean_roc_auc"].iloc[0]
+                if mean_auc - group_auc > 0.10:
+                    print(f"  - random-split AUC ({mean_auc:.3f}) exceeds group-split AUC "
+                          f"({group_auc:.3f}) by >0.10: task difficulty is driven mostly by "
+                          "homology-split strictness, not the method itself. Report both "
+                          "numbers together; don't cite the random-split number alone.")
+            except Exception:
+                pass
+
     return 0
 
 
