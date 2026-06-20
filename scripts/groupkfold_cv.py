@@ -199,40 +199,59 @@ def choose_reference(
     """Pick a reference sequence to align/score the rest of the family against.
 
     Priority:
-      1. The canonical named variant (e.g. "NDM-1") if present anywhere in
-         records -- most semantically meaningful when available.
-      2. A sequence from the LARGEST DIAMOND cluster among this family's own
-         sequences (family_assignments), since DIAMOND already grouped
-         mutually similar sequences together -- the biggest cluster is the
-         most "central"/representative subset of the family's diversity.
-      3. records[0] as an absolute last resort if no cluster info is given.
+      1. The LONGEST canonical named variant (e.g. "NDM-1") if present
+         anywhere in records -- most semantically meaningful when available.
+      2. The LONGEST sequence from the LARGEST DIAMOND cluster among this
+         family's own sequences (family_assignments), since DIAMOND already
+         grouped mutually similar sequences together -- the biggest cluster
+         is the most "central"/representative subset of the family's
+         diversity.
+      3. The LONGEST sequence in `records` overall as an absolute last
+         resort if no cluster info is given.
 
-    BUG FIX: this previously fell back straight to records[0] (just the
-    first sequence in FASTA file order -- essentially arbitrary) whenever no
-    canonical variant was found. Picking an outlier/divergent sequence as
-    reference makes nearly every OTHER sequence look "different everywhere"
-    against it under global alignment. That is exactly what caused IMP's
-    fold labels to come back with ~246/246 positions flagged as variant in
-    every single fold (see the run's [WARNING] block) -- not real biological
-    diversity, just a bad alignment anchor producing near-universal
-    mismatches. Anchoring to the largest cluster avoids that failure mode.
+    BUG FIX (round 1): this previously fell back straight to records[0]
+    (just the first sequence in FASTA file order -- essentially arbitrary)
+    whenever no canonical variant was found. Picking an outlier/divergent
+    sequence as reference makes nearly every OTHER sequence look "different
+    everywhere" against it under global alignment. That is exactly what
+    caused IMP's fold labels to come back with ~246/246 positions flagged
+    as variant in every single fold -- not real biological diversity, just
+    a bad alignment anchor producing near-universal mismatches.
+
+    BUG FIX (round 2): anchoring to "the largest cluster" alone was not
+    enough -- it still grabbed the FIRST record found in that cluster, which
+    can easily be a short/partial deposit (DIAMOND clusters sequences by
+    local similarity over their overlapping region, so a fragment can land
+    in the same cluster as full-length sequences despite covering only part
+    of the protein). Picking a short fragment as reference still produces
+    low alignment coverage for the rest of the family. This is exactly what
+    explained IMP (mean coverage 0.48) and VIM (mean coverage 0.41) -- most
+    of each family didn't even align to 70% of the chosen reference. Now
+    picks the LONGEST sequence within whichever tier applies, since a
+    longer sequence is far more likely to be the full-length mature protein
+    that most other family members can align well against.
     """
+    def _longest(candidates: List[SeqIO.SeqRecord]) -> SeqIO.SeqRecord:
+        return max(candidates, key=lambda r: len(str(r.seq)))
+
     canonical = _CANONICAL_VARIANT.get(family.upper())
     if canonical:
         pattern = re.compile(re.escape(canonical) + r"\b", re.I)
-        for rec in records:
-            if pattern.search(rec.description):
-                return rec
+        canonical_matches = [rec for rec in records if pattern.search(rec.description)]
+        if canonical_matches:
+            return _longest(canonical_matches)
 
     if family_assignments:
         cluster_sizes = Counter(family_assignments.values())
         if cluster_sizes:
             largest_cluster_id, _largest_size = cluster_sizes.most_common(1)[0]
-            for rec in records:
-                if family_assignments.get(rec.id) == largest_cluster_id:
-                    return rec
+            cluster_matches = [
+                rec for rec in records if family_assignments.get(rec.id) == largest_cluster_id
+            ]
+            if cluster_matches:
+                return _longest(cluster_matches)
 
-    return records[0]
+    return _longest(records)
 
 
 def align_reference_to_query(reference: str, query: str) -> Dict[int, Optional[int]]:
@@ -981,6 +1000,34 @@ def main() -> int:
             "If this family's count is 0, check that --input actually contains "
             "this family (re-run fetch_b1_superfamily.py with --families including it)."
         )
+
+    # Length-distribution diagnostic: a wide spread (e.g. 150-400 residues)
+    # signals mixed precursor (signal-peptide-included) vs. mature-form
+    # deposits, or genuine fragments, sitting in the same family bucket --
+    # this alone can explain low alignment coverage regardless of which
+    # reference is picked, since no single sequence will represent both a
+    # 150-residue mature protein and a 400-residue precursor well.
+    family_lengths = sorted(len(str(r.seq)) for r in records)
+    if family_lengths:
+        n = len(family_lengths)
+        p25 = family_lengths[n // 4]
+        p50 = family_lengths[n // 2]
+        p75 = family_lengths[min(n - 1, 3 * n // 4)]
+        print(
+            f"[{family}] sequence length distribution: "
+            f"min={family_lengths[0]}, p25={p25}, median={p50}, p75={p75}, "
+            f"max={family_lengths[-1]}  (n={n})"
+        )
+        if family_lengths[-1] > 0 and family_lengths[0] / family_lengths[-1] < 0.6:
+            print(
+                f"  [WARNING] length spread is wide (min/max ratio "
+                f"{family_lengths[0] / family_lengths[-1]:.2f}): likely mixed "
+                "precursor/mature-form or fragment deposits in this family's "
+                "fetched sequences. Picking a longer reference helps but may "
+                "not fully fix alignment coverage -- consider --min-length / "
+                "--max-length filters in fetch_b1_superfamily.py to tighten "
+                "the length range before re-fetching, or --exclude-fragments."
+            )
 
     # ------------------------------------------------------------------
     # Clustering (moved before reference selection: choose_reference now
