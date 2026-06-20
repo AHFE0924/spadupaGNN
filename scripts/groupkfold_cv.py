@@ -135,27 +135,59 @@ from collections import Counter
 NDM_FAMILY = "NDM"
 VIM_FAMILY = "VIM"
 IMP_FAMILY = "IMP"
+SPM_FAMILY = "SPM"
+GIM_FAMILY = "GIM"
+SIM_FAMILY = "SIM"
+ALL_FAMILIES = [NDM_FAMILY, VIM_FAMILY, IMP_FAMILY, SPM_FAMILY, GIM_FAMILY, SIM_FAMILY]
+
+# Canonical reference variant per family, used by choose_reference() below.
+_CANONICAL_VARIANT = {
+    NDM_FAMILY: "NDM-1",
+    VIM_FAMILY: "VIM-1",
+    IMP_FAMILY: "IMP-1",
+    SPM_FAMILY: "SPM-1",
+    GIM_FAMILY: "GIM-1",
+    SIM_FAMILY: "SIM-1",
+}
 
 
 def family_from_header(header: str) -> Optional[str]:
+    """Classify a UniProt FASTA header into one of the 6 B1 MBL families.
+
+    BUG FIX: the previous version only recognized NDM/VIM/IMP -- SPM, GIM,
+    and SIM always returned None, meaning `--family SPM` (etc.) would always
+    raise "No sequences found", and the family was silently unusable.
+
+    BUG FIX: the previous NDM/VIM/IMP patterns required a digit immediately
+    after the family code (e.g. "NDM-1", "VIM-2"), missing headers that
+    mention the family name without a trailing variant number (e.g. a
+    generic "NDM-type metallo-beta-lactamase" protein name) -- undercounting
+    real family members and explaining unexpectedly low n_sequences.
+
+    Matching strategy: for each family code FFF, search for an optional
+    "BLA"/"BLA-" prefix (covers gene names like "blaNDM-1" glued with no
+    separator) followed by FFF, requiring a word boundary immediately AFTER
+    the code (e.g. "NDM" followed by "-", a digit, a space, or end of
+    string) -- this still excludes accidental substring matches such as
+    "IMP" inside "IMPORTANT" or "IMPDH", but no longer requires a trailing
+    digit, so genuine family members get correctly counted.
+    """
     text = header.upper()
-    if re.search(r"BLA?NDM|NDM-?\d+|BLAN", text):
-        return NDM_FAMILY
-    if re.search(r"VIM-?\d+|BLBV", text):
-        return VIM_FAMILY
-    if re.search(r"IMP-?\d+|BLBI|BLA-?IMP", text):
-        return IMP_FAMILY
+    for fam in ALL_FAMILIES:
+        if re.search(rf"(?:BLA-?)?{fam}\b", text):
+            return fam
     return None
 
 
 def choose_reference(records: Sequence[SeqIO.SeqRecord], family: str) -> SeqIO.SeqRecord:
-    for rec in records:
-        if family == NDM_FAMILY and re.search(r"NDM-1\b|blaNDM-1", rec.description, re.I):
-            return rec
-        if family == VIM_FAMILY and re.search(r"VIM-1\b", rec.description, re.I):
-            return rec
-        if family == IMP_FAMILY and re.search(r"IMP-1\b", rec.description, re.I):
-            return rec
+    """Pick the canonical reference variant (e.g. NDM-1) if present in the
+    family's record set, otherwise fall back to the first record."""
+    canonical = _CANONICAL_VARIANT.get(family.upper())
+    if canonical:
+        pattern = re.compile(re.escape(canonical) + r"\b", re.I)
+        for rec in records:
+            if pattern.search(rec.description):
+                return rec
     return records[0]
 
 
@@ -410,6 +442,7 @@ def compute_scores_from_train(
     family: str = "VIM",
     structure_dir: Optional[Path] = None,
     contact_threshold: float = 8.0,
+    biophysical_weight: float = 0.10,
 ) -> Dict[str, np.ndarray]:
     ref_seq = str(reference.seq)
     n_residues = len(ref_seq)
@@ -438,7 +471,20 @@ def compute_scores_from_train(
     propagated = propagate_scores(var_norm, adj_norm, alpha=alpha, hops=hops)
 
     # Biophysical proximity term: distance to literature-sourced active site
-    # residues in BBL numbering.  Weight kept at 0.10 so GBSP signal dominates.
+    # residues in BBL numbering.
+    #
+    # NOTE on biophysical_weight default (0.10): this was an initial guess,
+    # NOT a fitted value. LR ablations (see compute_lr_baseline_scores) that
+    # learn this weight directly from data found it should be much higher
+    # and family-dependent: ~0.62 for NDM, ~0.47 for VIM, ~0.81 for IMP in
+    # initial runs (see [DECISIONS] / "LR-*-learned-*-weight" summary
+    # columns). There is no single fixed value that fits all families, so
+    # rather than hardcoding a new guess, this is exposed as --biophysical-
+    # weight; check that family's printed "LR-graph learned weights" line
+    # and pass it in directly to test whether it actually improves GBSP's
+    # ROC-AUC for that family (it improved NDM/VIM substantially in testing,
+    # but UNDERPERFORMED GBSP's default for IMP -- verify per-family, do not
+    # assume one weight generalizes).
     active_positions = get_active_site_positions(family, ref_seq)
     if active_positions:
         dist = np.array(
@@ -448,7 +494,7 @@ def compute_scores_from_train(
     else:
         dist = np.zeros(n_residues, dtype=np.float32)
     biophysical = robust_normalize(dist)
-    combined = 0.90 * propagated + 0.10 * biophysical
+    combined = (1.0 - biophysical_weight) * propagated + biophysical_weight * biophysical
 
     return {
         "variance": var_norm,
@@ -680,7 +726,7 @@ def embed_sequences(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="GroupKFold CV with clustering")
     parser.add_argument("--input", required=True, help="Input FASTA file")
-    parser.add_argument("--family", default="VIM", help="Family filter: NDM, VIM, IMP")
+    parser.add_argument("--family", default="VIM", help="Family filter: NDM, VIM, IMP, SPM, GIM, SIM")
     parser.add_argument("--identity", type=float, default=0.2, help="Cluster identity threshold (default: 0.2)")
     parser.add_argument("--clusters", default=None, help="Optional cluster CSV file")
     parser.add_argument(
@@ -715,6 +761,22 @@ def parse_args() -> argparse.Namespace:
         help="Cα–Cα distance threshold in Å for contact map (default: 8.0)",
     )
     parser.add_argument(
+        "--biophysical-weight",
+        type=float,
+        default=0.10,
+        help=(
+            "Weight (0-1) given to the active-site-distance term in GBSP's "
+            "combined score; (1-weight) goes to the propagated graph score. "
+            "Default 0.10 was an initial guess, not a fitted value -- LR "
+            "ablations in this script learn this weight directly from data "
+            "and print it per-family (see 'LR-graph learned weights' in the "
+            "run output / lr_graph_learned_biophysical_weight in the summary "
+            "CSV). Re-run with that value to test if it actually improves "
+            "ROC-AUC for your family -- it does NOT generalize across "
+            "families (helped NDM/VIM substantially, hurt IMP in testing)."
+        ),
+    )
+    parser.add_argument(
         "--split-method",
         choices=["group", "random"],
         default="group",
@@ -742,11 +804,36 @@ def main() -> int:
     # Structure dir — None disables AlphaFold graph entirely
     structure_dir: Optional[Path] = Path(args.structure_dir) if args.structure_dir else None
 
-    records = read_fasta_records(args.input)
+    all_records = read_fasta_records(args.input)
     family = args.family.upper()
-    records = [r for r in records if family_from_header(r.description) == family]
+
+    if family not in ALL_FAMILIES:
+        raise SystemExit(
+            f"Unknown family '{family}'. Must be one of: {', '.join(ALL_FAMILIES)}"
+        )
+
+    # Classify every sequence in the input fasta so n_sequences is verifiable,
+    # not just trusted blindly -- this also makes it visible if most of the
+    # file is unclassified ("OTHER"), which would explain a low per-family count.
+    family_counts: Dict[str, int] = {fam: 0 for fam in ALL_FAMILIES}
+    other_count = 0
+    for rec in all_records:
+        fam = family_from_header(rec.description)
+        if fam:
+            family_counts[fam] += 1
+        else:
+            other_count += 1
+    print(f"[Classification] total sequences in input: {len(all_records)}")
+    print(f"[Classification] by family: {family_counts}  |  unclassified (OTHER): {other_count}")
+
+    records = [r for r in all_records if family_from_header(r.description) == family]
     if not records:
-        raise SystemExit(f"No sequences found for family {family} in {args.input}")
+        raise SystemExit(
+            f"No sequences found for family {family} in {args.input}. "
+            f"Classification counts were: {family_counts} (OTHER={other_count}). "
+            "If this family's count is 0, check that --input actually contains "
+            "this family (re-run fetch_b1_superfamily.py with --families including it)."
+        )
 
     reference = choose_reference(records, family)
     non_reference = [r for r in records if r.id != reference.id]
@@ -874,6 +961,7 @@ def main() -> int:
             alpha=args.alpha, hops=args.hops, family=family,
             structure_dir=structure_dir,
             contact_threshold=args.contact_threshold,
+            biophysical_weight=args.biophysical_weight,
         )
 
         # KNN baseline (k=1)
