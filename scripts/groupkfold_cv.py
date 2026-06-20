@@ -572,42 +572,54 @@ def compute_lr_baseline_scores(
     y_true: np.ndarray,
     n_splits: int = 5,
     seed: int = 0,
-) -> Tuple[float, float]:
+) -> Tuple[float, float, Optional[np.ndarray]]:
     """Logistic regression on GBSP's raw ingredients, evaluated out-of-fold.
 
     Ablation requested per ORNL feedback: GBSP combines per-position variance
     and active-site distance via a FIXED formula (propagate, then
     0.90*graph + 0.10*biophysical).  This baseline instead lets a tiny LR
-    LEARN how to combine the same two raw signals (pre-propagation variance
-    and biophysical distance).  If LR beats GBSP, the fixed combination/
-    propagation is not adding value and should be replaced with a learned
-    blend; if GBSP beats LR, propagation is doing real work.
+    LEARN how to combine the same two raw signals.  If LR beats GBSP, the
+    fixed combination/propagation is not adding value and should be
+    replaced with a learned blend; if GBSP beats LR, propagation is doing
+    real work.
 
-    `features` shape: (n_residues, n_features) -- typically [variance, biophysical].
+    `features` shape: (n_residues, n_features) -- e.g. [variance, biophysical]
+    (raw, pre-propagation) or [graph, biophysical] (post-propagation, GBSP's
+    own ingredients with a learned weight instead of the fixed 0.90/0.10).
     `y_true` shape: (n_residues,) -- same labels GBSP/KNN are scored against.
 
     Evaluated via StratifiedKFold over residue POSITIONS (not sequences) so
     the LR itself is cross-validated; out-of-fold predictions are pooled
-    before computing ROC-AUC/PR-AUC.  Returns (nan, nan) if y_true has too
-    few examples of either class to stratify.
+    before computing ROC-AUC/PR-AUC.  Returns (nan, nan, None) if y_true has
+    too few examples of either class to stratify.
+
+    Also returns the mean (|coef|, L1-normalized) fitted weights across
+    folds so callers can report what blend the LR actually found useful --
+    e.g. "0.34 / 0.66" instead of the hardcoded "0.90 / 0.10" -- as a
+    concrete, actionable alternative rather than just a pass/fail signal.
     """
     n = len(y_true)
     if y_true.sum() < n_splits or (n - y_true.sum()) < n_splits:
-        return float("nan"), float("nan")
+        return float("nan"), float("nan"), None
 
     try:
         skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
         oof_scores = np.zeros(n, dtype=np.float64)
+        fold_coefs: List[np.ndarray] = []
         for train_idx, test_idx in skf.split(features, y_true):
             clf = LogisticRegression(max_iter=1000, class_weight="balanced")
             clf.fit(features[train_idx], y_true[train_idx])
             oof_scores[test_idx] = clf.predict_proba(features[test_idx])[:, 1]
+            fold_coefs.append(clf.coef_[0])
         roc = roc_auc_score(y_true, oof_scores)
         pr = average_precision_score(y_true, oof_scores)
-        return float(roc), float(pr)
+        mean_coef = np.mean(np.stack(fold_coefs, axis=0), axis=0)
+        abs_coef = np.abs(mean_coef)
+        norm_weights = abs_coef / (abs_coef.sum() + 1e-8)
+        return float(roc), float(pr), norm_weights
     except Exception as exc:
         print(f"Warning: LR baseline failed ({exc})")
-        return float("nan"), float("nan")
+        return float("nan"), float("nan"), None
 
 
 # ---------------------------------------------------------------------------
@@ -843,6 +855,10 @@ def main() -> int:
     aps_knn = []
     aucs_lr = []
     aps_lr = []
+    aucs_lr_graph = []
+    aps_lr_graph = []
+    lr_raw_weights_per_fold: List[np.ndarray] = []
+    lr_graph_weights_per_fold: List[np.ndarray] = []
     fold_labels = []
     fold_scores_gbsp = []
 
@@ -887,10 +903,24 @@ def main() -> int:
         fpr_knn, tpr_knn, _ = roc_curve(y_true, knn_scores)
         prec_knn, rec_knn, _ = precision_recall_curve(y_true, knn_scores)
 
-        # LR baseline: learned combination of GBSP's raw (pre-propagation)
+        # LR baseline A: learned combination of GBSP's raw (pre-propagation)
         # ingredients -- variance + biophysical distance.
         lr_features = np.stack([scores["variance"], scores["biophysical"]], axis=1)
-        roc_auc_lr, ap_lr = compute_lr_baseline_scores(lr_features, y_true)
+        roc_auc_lr, ap_lr, lr_weights = compute_lr_baseline_scores(lr_features, y_true)
+        if lr_weights is not None:
+            lr_raw_weights_per_fold.append(lr_weights)
+
+        # LR baseline B: learned combination of the POST-propagation graph
+        # score + biophysical distance -- GBSP's exact two ingredients, but
+        # with a learned blend weight instead of the hardcoded 0.90/0.10.
+        # Comparing A vs B isolates whether propagation itself helps/hurts
+        # independent of the fixed weighting: if B beats A, propagation adds
+        # signal and only the fixed weight was wrong; if B is no better than
+        # A, propagation itself is destroying signal regardless of weighting.
+        lr_graph_features = np.stack([scores["graph"], scores["biophysical"]], axis=1)
+        roc_auc_lr_graph, ap_lr_graph, lr_graph_weights = compute_lr_baseline_scores(lr_graph_features, y_true)
+        if lr_graph_weights is not None:
+            lr_graph_weights_per_fold.append(lr_graph_weights)
 
         aucs_gbsp.append(roc_auc_gbsp)
         aps_gbsp.append(ap_gbsp)
@@ -898,6 +928,8 @@ def main() -> int:
         aps_knn.append(ap_knn)
         aucs_lr.append(roc_auc_lr)
         aps_lr.append(ap_lr)
+        aucs_lr_graph.append(roc_auc_lr_graph)
+        aps_lr_graph.append(ap_lr_graph)
 
         roc_curves_gbsp.append((fpr_gbsp, tpr_gbsp, roc_auc_gbsp))
         pr_curves_gbsp.append((rec_gbsp, prec_gbsp, ap_gbsp))
@@ -917,8 +949,10 @@ def main() -> int:
                 "gbsp_pr_auc": ap_gbsp,
                 "knn_roc_auc": roc_auc_knn,
                 "knn_pr_auc": ap_knn,
-                "lr_roc_auc": roc_auc_lr,
-                "lr_pr_auc": ap_lr,
+                "lr_raw_roc_auc": roc_auc_lr,
+                "lr_raw_pr_auc": ap_lr,
+                "lr_graph_roc_auc": roc_auc_lr_graph,
+                "lr_graph_pr_auc": ap_lr_graph,
             }
         )
 
@@ -942,6 +976,23 @@ def main() -> int:
     std_auc_lr = float(np.std(valid_lr_auc)) if valid_lr_auc else float("nan")
     mean_ap_lr = float(np.mean(valid_lr_ap)) if valid_lr_ap else float("nan")
     std_ap_lr = float(np.std(valid_lr_ap)) if valid_lr_ap else float("nan")
+
+    valid_lr_graph_auc = [v for v in aucs_lr_graph if not np.isnan(v)]
+    valid_lr_graph_ap = [v for v in aps_lr_graph if not np.isnan(v)]
+    mean_auc_lr_graph = float(np.mean(valid_lr_graph_auc)) if valid_lr_graph_auc else float("nan")
+    std_auc_lr_graph = float(np.std(valid_lr_graph_auc)) if valid_lr_graph_auc else float("nan")
+    mean_ap_lr_graph = float(np.mean(valid_lr_graph_ap)) if valid_lr_graph_ap else float("nan")
+    std_ap_lr_graph = float(np.std(valid_lr_graph_ap)) if valid_lr_graph_ap else float("nan")
+
+    # Mean learned blend weights across folds: [signal_weight, biophysical_weight]
+    mean_lr_raw_weights = (
+        np.mean(np.stack(lr_raw_weights_per_fold, axis=0), axis=0)
+        if lr_raw_weights_per_fold else None
+    )
+    mean_lr_graph_weights = (
+        np.mean(np.stack(lr_graph_weights_per_fold, axis=0), axis=0)
+        if lr_graph_weights_per_fold else None
+    )
 
     # Bootstrap CI for mean AUC/AP (GBSP)
     ci_auc_lower = ci_auc_upper = ci_ap_lower = ci_ap_upper = float("nan")
@@ -1009,14 +1060,25 @@ def main() -> int:
         "knn_std_roc_auc": std_auc_knn,
         "knn_mean_pr_auc": mean_ap_knn,
         "knn_std_pr_auc": std_ap_knn,
-        # LR baseline (learned combination of GBSP's raw ingredients)
-        "lr_mean_roc_auc": mean_auc_lr,
-        "lr_std_roc_auc": std_auc_lr,
-        "lr_mean_pr_auc": mean_ap_lr,
-        "lr_std_pr_auc": std_ap_lr,
+        # LR baseline A: learned blend of raw (pre-propagation) ingredients
+        "lr_raw_mean_roc_auc": mean_auc_lr,
+        "lr_raw_std_roc_auc": std_auc_lr,
+        "lr_raw_mean_pr_auc": mean_ap_lr,
+        "lr_raw_std_pr_auc": std_ap_lr,
+        "lr_raw_learned_signal_weight": float(mean_lr_raw_weights[0]) if mean_lr_raw_weights is not None else float("nan"),
+        "lr_raw_learned_biophysical_weight": float(mean_lr_raw_weights[1]) if mean_lr_raw_weights is not None else float("nan"),
+        # LR baseline B: learned blend of GBSP's exact (post-propagation) ingredients
+        "lr_graph_mean_roc_auc": mean_auc_lr_graph,
+        "lr_graph_std_roc_auc": std_auc_lr_graph,
+        "lr_graph_mean_pr_auc": mean_ap_lr_graph,
+        "lr_graph_std_pr_auc": std_ap_lr_graph,
+        "lr_graph_learned_signal_weight": float(mean_lr_graph_weights[0]) if mean_lr_graph_weights is not None else float("nan"),
+        "lr_graph_learned_biophysical_weight": float(mean_lr_graph_weights[1]) if mean_lr_graph_weights is not None else float("nan"),
         # Convenience deltas
         "delta_roc_auc_gbsp_minus_knn": mean_auc - mean_auc_knn,
-        "delta_roc_auc_gbsp_minus_lr": mean_auc - mean_auc_lr,
+        "delta_roc_auc_gbsp_minus_lr_raw": mean_auc - mean_auc_lr,
+        "delta_roc_auc_gbsp_minus_lr_graph": mean_auc - mean_auc_lr_graph,
+        "delta_roc_auc_lr_graph_minus_lr_raw": mean_auc_lr_graph - mean_auc_lr,
     }
     pd.DataFrame([summary]).to_csv(output_dir / f"cv_{out_tag}_summary.csv", index=False)
 
@@ -1062,11 +1124,22 @@ def main() -> int:
     print(f"Saved fold metrics: {output_dir / f'cv_{out_tag}_folds.csv'}")
     print(f"Saved summary:      {output_dir / f'cv_{out_tag}_summary.csv'}")
     print(f"Saved ROC/PR plot:  {fig_path}")
-    print(f"\n[{family} / {args.split_method}] GBSP ROC-AUC: {mean_auc:.4f} ± {std_auc:.4f}")
-    print(f"[{family} / {args.split_method}] KNN  ROC-AUC: {mean_auc_knn:.4f} ± {std_auc_knn:.4f}  "
-          f"(delta={mean_auc - mean_auc_knn:+.4f})")
-    print(f"[{family} / {args.split_method}] LR   ROC-AUC: {mean_auc_lr:.4f} ± {std_auc_lr:.4f}  "
-          f"(delta={mean_auc - mean_auc_lr:+.4f})")
+    print(f"\n[{family} / {args.split_method}] GBSP     ROC-AUC: {mean_auc:.4f} ± {std_auc:.4f}  "
+          "(propagated graph score, fixed 0.90/0.10 blend)")
+    print(f"[{family} / {args.split_method}] KNN      ROC-AUC: {mean_auc_knn:.4f} ± {std_auc_knn:.4f}  "
+          f"(delta vs GBSP={mean_auc - mean_auc_knn:+.4f})")
+    print(f"[{family} / {args.split_method}] LR-raw   ROC-AUC: {mean_auc_lr:.4f} ± {std_auc_lr:.4f}  "
+          f"(learned blend of PRE-propagation variance + biophysical; "
+          f"delta vs GBSP={mean_auc - mean_auc_lr:+.4f})")
+    print(f"[{family} / {args.split_method}] LR-graph ROC-AUC: {mean_auc_lr_graph:.4f} ± {std_auc_lr_graph:.4f}  "
+          f"(learned blend of GBSP's own POST-propagation graph score + biophysical; "
+          f"delta vs GBSP={mean_auc - mean_auc_lr_graph:+.4f})")
+    if mean_lr_raw_weights is not None:
+        print(f"  LR-raw learned weights:   signal={mean_lr_raw_weights[0]:.2f} / "
+              f"biophysical={mean_lr_raw_weights[1]:.2f}  (vs GBSP's hardcoded N/A / N/A, raw has no fixed blend)")
+    if mean_lr_graph_weights is not None:
+        print(f"  LR-graph learned weights: graph={mean_lr_graph_weights[0]:.2f} / "
+              f"biophysical={mean_lr_graph_weights[1]:.2f}  (vs GBSP's hardcoded 0.90 / 0.10)")
 
     # ------------------------------------------------------------------
     # Decision rules (printed, not enforced) -- flags worth acting on
@@ -1081,11 +1154,32 @@ def main() -> int:
     if not np.isnan(mean_auc_knn) and abs(mean_auc - mean_auc_knn) < 0.02:
         print("  - |GBSP-KNN| < 0.02: graph propagation adds negligible value over "
               "naive k=1 similarity search for this family.")
-    if not np.isnan(mean_auc_lr) and mean_auc_lr > mean_auc + 0.02:
-        print(f"  - LR ({mean_auc_lr:.3f}) beats GBSP ({mean_auc:.3f}) by >0.02: "
-              "the fixed 0.90/0.10 weighting + propagation is hurting relative to a "
-              "learned linear combination of the same raw signals. Consider learning "
-              "the blend weight instead of hardcoding it.")
+
+    # Isolate whether the FIXED 0.90/0.10 weighting or PROPAGATION ITSELF
+    # is responsible for any GBSP underperformance vs the LR ablations.
+    if not np.isnan(mean_auc_lr) and not np.isnan(mean_auc_lr_graph):
+        if mean_auc_lr_graph > mean_auc + 0.02 and mean_auc_lr_graph >= mean_auc_lr - 0.02:
+            if mean_lr_graph_weights is not None:
+                print(f"  - LR-graph ({mean_auc_lr_graph:.3f}) beats GBSP ({mean_auc:.3f}) and matches/beats "
+                      f"LR-raw ({mean_auc_lr:.3f}): propagation itself is fine -- the hardcoded 0.90/0.10 "
+                      "blend weight is the problem. Fix: use the learned weight instead "
+                      f"(graph={mean_lr_graph_weights[0]:.2f} / biophysical={mean_lr_graph_weights[1]:.2f}) "
+                      "rather than the fixed 0.90/0.10 ratio.")
+            else:
+                print(f"  - LR-graph ({mean_auc_lr_graph:.3f}) beats GBSP ({mean_auc:.3f}) and matches/beats "
+                      f"LR-raw ({mean_auc_lr:.3f}): propagation itself is fine -- the hardcoded 0.90/0.10 "
+                      "blend weight is the problem. Fix: learn the blend weight instead of hardcoding it.")
+        elif mean_auc_lr > mean_auc_lr_graph + 0.02:
+            print(f"  - LR-raw ({mean_auc_lr:.3f}) beats LR-graph ({mean_auc_lr_graph:.3f}) even though "
+                  f"both use a LEARNED weight: propagation (alpha={args.alpha:.2f}, hops={args.hops}) "
+                  "is destroying signal regardless of how it's weighted. Fix: lower hops, raise alpha "
+                  "(less smoothing), or try --structure-dir '' to compare against the chain-graph "
+                  "fallback directly.")
+        elif mean_auc_lr_graph > mean_auc + 0.02:
+            print(f"  - LR-graph ({mean_auc_lr_graph:.3f}) beats GBSP ({mean_auc:.3f}): even using GBSP's "
+                  "own post-propagation signal, a learned blend beats the fixed 0.90/0.10 ratio. "
+                  "Fix: learn the blend weight instead of hardcoding it.")
+
     if args.split_method == "group":
         print("  - Run the same family with --split-method random to quantify how much "
               "homology-aware splitting is responsible for the score (compare cv_"
