@@ -191,15 +191,47 @@ def family_from_header(header: str) -> Optional[str]:
     return None
 
 
-def choose_reference(records: Sequence[SeqIO.SeqRecord], family: str) -> SeqIO.SeqRecord:
-    """Pick the canonical reference variant (e.g. NDM-1) if present in the
-    family's record set, otherwise fall back to the first record."""
+def choose_reference(
+    records: Sequence[SeqIO.SeqRecord],
+    family: str,
+    family_assignments: Optional[Dict[str, int]] = None,
+) -> SeqIO.SeqRecord:
+    """Pick a reference sequence to align/score the rest of the family against.
+
+    Priority:
+      1. The canonical named variant (e.g. "NDM-1") if present anywhere in
+         records -- most semantically meaningful when available.
+      2. A sequence from the LARGEST DIAMOND cluster among this family's own
+         sequences (family_assignments), since DIAMOND already grouped
+         mutually similar sequences together -- the biggest cluster is the
+         most "central"/representative subset of the family's diversity.
+      3. records[0] as an absolute last resort if no cluster info is given.
+
+    BUG FIX: this previously fell back straight to records[0] (just the
+    first sequence in FASTA file order -- essentially arbitrary) whenever no
+    canonical variant was found. Picking an outlier/divergent sequence as
+    reference makes nearly every OTHER sequence look "different everywhere"
+    against it under global alignment. That is exactly what caused IMP's
+    fold labels to come back with ~246/246 positions flagged as variant in
+    every single fold (see the run's [WARNING] block) -- not real biological
+    diversity, just a bad alignment anchor producing near-universal
+    mismatches. Anchoring to the largest cluster avoids that failure mode.
+    """
     canonical = _CANONICAL_VARIANT.get(family.upper())
     if canonical:
         pattern = re.compile(re.escape(canonical) + r"\b", re.I)
         for rec in records:
             if pattern.search(rec.description):
                 return rec
+
+    if family_assignments:
+        cluster_sizes = Counter(family_assignments.values())
+        if cluster_sizes:
+            largest_cluster_id, _largest_size = cluster_sizes.most_common(1)[0]
+            for rec in records:
+                if family_assignments.get(rec.id) == largest_cluster_id:
+                    return rec
+
     return records[0]
 
 
@@ -225,13 +257,50 @@ def align_reference_to_query(reference: str, query: str) -> Dict[int, Optional[i
     return mapping
 
 
+def alignment_coverage(reference: str, query: str) -> float:
+    """Fraction of reference positions that successfully align to a
+    non-gap position in query. Used to detect fragment/precursor-mismatched
+    sequences before they're allowed to contribute to variant labeling."""
+    mapping = align_reference_to_query(reference, query)
+    if not mapping:
+        return 0.0
+    n_mapped = sum(1 for v in mapping.values() if v is not None)
+    return n_mapped / len(mapping)
+
+
+# Sequences whose alignment to the reference covers less than this fraction
+# of reference positions are excluded from contributing to variant-position
+# labels (see project_variant_positions). Below this threshold, a sequence
+# is more likely a fragment, precursor (signal-peptide-included) entry, or
+# otherwise structurally mismatched to the reference than a genuine
+# full-length homolog with real biological indels -- without this filter,
+# ONE such sequence in a test fold can mark nearly the entire reference as
+# "variant" via unmapped (gap) positions, which is an alignment artifact,
+# not evidence of mutation tolerance.
+MIN_ALIGNMENT_COVERAGE = 0.70
+
+
 def project_variant_positions(reference: str, query: str) -> List[int]:
+    """Reference positions where `query` carries a genuine amino-acid
+    substitution relative to `reference`.
+
+    BUG FIX: the previous version also flagged any position where `query`
+    didn't align at all (a gap, query_idx is None) as "variant" -- this
+    conflates "this position differs" with "this sequence doesn't cover
+    this position" (e.g. due to a missing signal peptide, a fragment
+    deposit, or a large indel elsewhere shifting the alignment). A single
+    low-coverage sequence in a test fold could therefore mark almost the
+    entire reference as variant, regardless of real biology. Gaps are now
+    excluded entirely (neither positive nor negative) rather than counted
+    as positive. Combine with alignment_coverage()/MIN_ALIGNMENT_COVERAGE to
+    filter out low-coverage sequences before calling this function at all.
+    """
     mapping = align_reference_to_query(reference, query)
     variant_positions: List[int] = []
     for ref_idx, query_idx in mapping.items():
         if query_idx is None or ref_idx >= len(reference) or query_idx >= len(query):
-            variant_positions.append(ref_idx)
-        elif reference[ref_idx] != query[query_idx]:
+            continue
+        if reference[ref_idx] != query[query_idx]:
             variant_positions.append(ref_idx)
     return sorted(set(variant_positions))
 
@@ -913,11 +982,10 @@ def main() -> int:
             "this family (re-run fetch_b1_superfamily.py with --families including it)."
         )
 
-    reference = choose_reference(records, family)
-    non_reference = [r for r in records if r.id != reference.id]
-
     # ------------------------------------------------------------------
-    # Clustering
+    # Clustering (moved before reference selection: choose_reference now
+    # uses family_assignments to anchor on the largest cluster instead of
+    # an arbitrary records[0] -- see choose_reference docstring for why).
     # ------------------------------------------------------------------
     cluster_csv = None
     if args.clusters:
@@ -933,10 +1001,6 @@ def main() -> int:
         )
         assignments = result.assignments
         write_cluster_csv(assignments, cluster_csv)
-
-    groups = [assignments.get(rec.id, -1) for rec in non_reference]
-    unique_groups = len(set(groups))
-    n_samples = len(non_reference)
 
     # ------------------------------------------------------------------
     # Corrected per-family cluster report.
@@ -962,6 +1026,36 @@ def main() -> int:
             f"median cluster size: {median_cluster_size} | "
             f"max: {max_cluster_size} ({max_cluster_fraction:.0%} of family) | "
             f"singletons: {n_singletons}"
+        )
+
+    # ------------------------------------------------------------------
+    # Reference selection (uses family_assignments computed above to anchor
+    # on the largest cluster -- see choose_reference docstring) and the
+    # resulting train/test pool.
+    # ------------------------------------------------------------------
+    reference = choose_reference(records, family, family_assignments)
+    non_reference = [r for r in records if r.id != reference.id]
+    groups = [family_assignments.get(rec.id, -1) for rec in non_reference]
+    unique_groups = len(set(groups))
+    n_samples = len(non_reference)
+
+    # One-time alignment-coverage diagnostic: how many of this family's
+    # sequences actually align well to the chosen reference? A low-coverage
+    # sequence (signal peptide mismatch, fragment, big indel) contributes
+    # mostly gap/unmapped positions, which used to be silently counted as
+    # "variant" -- see project_variant_positions docstring for the bug this
+    # exposed (IMP/VIM coming back with ~100% of positions flagged variant
+    # in every fold). This print makes the coverage distribution visible so
+    # a bad reference choice or a fragment-heavy dataset shows up directly.
+    ref_seq_for_coverage = str(reference.seq)
+    coverages = [alignment_coverage(ref_seq_for_coverage, str(r.seq)) for r in non_reference]
+    n_low_coverage = sum(1 for c in coverages if c < MIN_ALIGNMENT_COVERAGE)
+    if coverages:
+        print(
+            f"[{family}] alignment coverage to reference: "
+            f"mean={np.mean(coverages):.2f}, median={np.median(coverages):.2f}, "
+            f"{n_low_coverage}/{len(coverages)} sequences below "
+            f"{MIN_ALIGNMENT_COVERAGE:.0%} coverage (excluded from variant labeling)"
         )
 
     if unique_groups < 2 or n_samples < 2:
@@ -1051,9 +1145,20 @@ def main() -> int:
         # KNN baseline (k=1)
         knn_scores = compute_knn_scores(reference, train_records, test_records, embeddings)
 
-        # Labels: positions that vary in test sequences relative to reference
+        # Labels: positions that vary in test sequences relative to reference.
+        # Sequences below MIN_ALIGNMENT_COVERAGE are excluded here -- a
+        # fragment/precursor-mismatched sequence contributes mostly gap
+        # positions, which (since the project_variant_positions fix) no
+        # longer count as "variant" on their own, but a low-coverage
+        # sequence's few aligned positions can still be noisy local
+        # mismatches rather than real substitutions, so it's safest to
+        # exclude such sequences from contributing labels entirely.
         positive_positions: List[int] = []
+        n_excluded_low_coverage = 0
         for rec in test_records:
+            if alignment_coverage(ref_seq, str(rec.seq)) < MIN_ALIGNMENT_COVERAGE:
+                n_excluded_low_coverage += 1
+                continue
             positive_positions.extend(project_variant_positions(ref_seq, str(rec.seq)))
         positive_positions = sorted(set(positive_positions))
 
@@ -1064,8 +1169,10 @@ def main() -> int:
         n_neg = int(len(y_true) - n_pos)
         if n_pos < MIN_CLASS_COUNT or n_neg < MIN_CLASS_COUNT:
             skipped_fold_reasons.append(
-                f"fold {fold_idx}: n_test={len(test_records)}, positive_positions={n_pos}, "
-                f"negative_positions={n_neg} (need >= {MIN_CLASS_COUNT} of each)"
+                f"fold {fold_idx}: n_test={len(test_records)} "
+                f"({n_excluded_low_coverage} excluded for low alignment coverage), "
+                f"positive_positions={n_pos}, negative_positions={n_neg} "
+                f"(need >= {MIN_CLASS_COUNT} of each)"
             )
             continue
 
