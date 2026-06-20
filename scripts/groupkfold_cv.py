@@ -140,6 +140,18 @@ GIM_FAMILY = "GIM"
 SIM_FAMILY = "SIM"
 ALL_FAMILIES = [NDM_FAMILY, VIM_FAMILY, IMP_FAMILY, SPM_FAMILY, GIM_FAMILY, SIM_FAMILY]
 
+# Minimum number of positive AND negative residue positions required for a
+# fold's labels to be considered meaningful. The old guard only skipped
+# folds with LITERALLY 0% or 100% positive positions, which let through
+# near-degenerate folds (e.g. 2 positives out of 270 positions) that can
+# produce a spuriously perfect ROC-AUC by chance rather than real signal.
+# Used consistently by both the main GBSP/KNN scoring loop AND the LR
+# ablation, so all three methods are scored on the same set of folds and
+# their deltas stay comparable (previously LR silently bailed to NaN on
+# fold class-imbalance while GBSP/KNN scored the same degenerate fold
+# anyway, producing misleading "perfect" results -- see IMP "1.0 ± 0.0").
+MIN_CLASS_COUNT = 5
+
 # Canonical reference variant per family, used by choose_reference() below.
 _CANONICAL_VARIANT = {
     NDM_FAMILY: "NDM-1",
@@ -610,6 +622,65 @@ def _find_nearest_neighbour(
 
 
 # ---------------------------------------------------------------------------
+# Biophysical weight auto-resolution
+# ---------------------------------------------------------------------------
+
+DEFAULT_BIOPHYSICAL_WEIGHT = 0.10
+
+
+def resolve_biophysical_weight(
+    explicit_weight: Optional[float],
+    family: str,
+    output_dir: Path,
+    split_method: str,
+) -> Tuple[float, str]:
+    """Resolve the biophysical blend weight to actually use for this run.
+
+    Priority:
+      1. --biophysical-weight passed explicitly on the CLI -> use it as-is.
+      2. A previous run's cv_<family>_<split>_summary.csv in --output already
+         has a valid lr_graph_learned_biophysical_weight for this exact
+         family -- reuse it. This is the weight an LR ablation found useful
+         on this family's own data, so it's a much better default than a
+         hardcoded guess, and it stays correct even if the dataset changes
+         between runs (re-running the LR ablation updates the CSV, the next
+         run picks up the new value automatically).
+      3. Try the OTHER split method's summary (group vs random) as a weaker
+         fallback, in case only one split type has been run so far.
+      4. DEFAULT_BIOPHYSICAL_WEIGHT (0.10) if nothing usable is found --
+         e.g. first-ever run for this family, or every prior run's LR
+         ablation was NaN (degenerate folds; see MIN_CLASS_COUNT).
+
+    Returns (weight, human-readable source description for logging).
+    """
+    if explicit_weight is not None:
+        return explicit_weight, "explicit --biophysical-weight override"
+
+    for candidate_split in (split_method, "random" if split_method == "group" else "group"):
+        summary_path = output_dir / f"cv_{family.lower()}_{candidate_split}_summary.csv"
+        if not summary_path.exists():
+            continue
+        try:
+            df = pd.read_csv(summary_path)
+            if "lr_graph_learned_biophysical_weight" not in df.columns:
+                continue
+            val = df["lr_graph_learned_biophysical_weight"].iloc[0]
+            if pd.isna(val):
+                continue
+            return float(val), (
+                f"auto-loaded from {summary_path.name} "
+                f"(split={candidate_split}, LR-graph-learned)"
+            )
+        except Exception:
+            continue
+
+    return DEFAULT_BIOPHYSICAL_WEIGHT, (
+        f"no usable prior run found for {family} in {output_dir}; "
+        f"using un-fitted default {DEFAULT_BIOPHYSICAL_WEIGHT}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Logistic Regression baseline (raw-feature ablation)
 # ---------------------------------------------------------------------------
 
@@ -645,7 +716,8 @@ def compute_lr_baseline_scores(
     concrete, actionable alternative rather than just a pass/fail signal.
     """
     n = len(y_true)
-    if y_true.sum() < n_splits or (n - y_true.sum()) < n_splits:
+    min_required = max(n_splits, MIN_CLASS_COUNT)
+    if y_true.sum() < min_required or (n - y_true.sum()) < min_required:
         return float("nan"), float("nan"), None
 
     try:
@@ -763,17 +835,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--biophysical-weight",
         type=float,
-        default=0.10,
+        default=None,
         help=(
             "Weight (0-1) given to the active-site-distance term in GBSP's "
             "combined score; (1-weight) goes to the propagated graph score. "
-            "Default 0.10 was an initial guess, not a fitted value -- LR "
-            "ablations in this script learn this weight directly from data "
-            "and print it per-family (see 'LR-graph learned weights' in the "
-            "run output / lr_graph_learned_biophysical_weight in the summary "
-            "CSV). Re-run with that value to test if it actually improves "
-            "ROC-AUC for your family -- it does NOT generalize across "
-            "families (helped NDM/VIM substantially, hurt IMP in testing)."
+            "If not set (default), the script AUTO-RESOLVES this per family: "
+            "it looks for a previous run's cv_<family>_<split>_summary.csv in "
+            "--output and reuses that family's lr_graph_learned_biophysical_weight "
+            "(the value an LR ablation actually found useful), falling back to "
+            "0.10 if no prior run exists. Pass this flag explicitly to override "
+            "auto-resolution. The learned weight does NOT generalize across "
+            "families -- it is resolved separately for whichever --family is "
+            "being run."
         ),
     )
     parser.add_argument(
@@ -811,6 +884,11 @@ def main() -> int:
         raise SystemExit(
             f"Unknown family '{family}'. Must be one of: {', '.join(ALL_FAMILIES)}"
         )
+
+    biophysical_weight, weight_source = resolve_biophysical_weight(
+        args.biophysical_weight, family, output_dir, args.split_method
+    )
+    print(f"[Weight] biophysical_weight={biophysical_weight:.3f}  (source: {weight_source})")
 
     # Classify every sequence in the input fasta so n_sequences is verifiable,
     # not just trusted blindly -- this also makes it visible if most of the
@@ -870,15 +948,20 @@ def main() -> int:
     family_assignments = {sid: cid for sid, cid in assignments.items() if sid in family_seq_ids}
     cluster_sizes = Counter(family_assignments.values())
     median_cluster_size = float("nan")
+    max_cluster_size = 0
+    max_cluster_fraction = float("nan")
     if cluster_sizes:
         size_vals = sorted(cluster_sizes.values())
         median_cluster_size = size_vals[len(size_vals) // 2]
         n_singletons = sum(1 for s in size_vals if s == 1)
+        max_cluster_size = max(size_vals)
+        max_cluster_fraction = max_cluster_size / max(1, len(family_seq_ids))
         print(
             f"\n[{family}] sequences: {len(family_seq_ids)} | "
             f"clusters (this family): {len(cluster_sizes)} | "
             f"median cluster size: {median_cluster_size} | "
-            f"max: {max(size_vals)} | singletons: {n_singletons}"
+            f"max: {max_cluster_size} ({max_cluster_fraction:.0%} of family) | "
+            f"singletons: {n_singletons}"
         )
 
     if unique_groups < 2 or n_samples < 2:
@@ -946,6 +1029,7 @@ def main() -> int:
     aps_lr_graph = []
     lr_raw_weights_per_fold: List[np.ndarray] = []
     lr_graph_weights_per_fold: List[np.ndarray] = []
+    skipped_fold_reasons: List[str] = []
     fold_labels = []
     fold_scores_gbsp = []
 
@@ -961,7 +1045,7 @@ def main() -> int:
             alpha=args.alpha, hops=args.hops, family=family,
             structure_dir=structure_dir,
             contact_threshold=args.contact_threshold,
-            biophysical_weight=args.biophysical_weight,
+            biophysical_weight=biophysical_weight,
         )
 
         # KNN baseline (k=1)
@@ -976,7 +1060,13 @@ def main() -> int:
         y_true = np.array(
             [1 if i in positive_positions else 0 for i in range(len(ref_seq))], dtype=int
         )
-        if y_true.sum() == 0 or y_true.sum() == len(y_true):
+        n_pos = int(y_true.sum())
+        n_neg = int(len(y_true) - n_pos)
+        if n_pos < MIN_CLASS_COUNT or n_neg < MIN_CLASS_COUNT:
+            skipped_fold_reasons.append(
+                f"fold {fold_idx}: n_test={len(test_records)}, positive_positions={n_pos}, "
+                f"negative_positions={n_neg} (need >= {MIN_CLASS_COUNT} of each)"
+            )
             continue
 
         # GBSP metrics
@@ -1047,6 +1137,20 @@ def main() -> int:
     fold_df = pd.DataFrame(fold_rows)
     out_tag = f"{family.lower()}_{args.split_method}"
     fold_df.to_csv(output_dir / f"cv_{out_tag}_folds.csv", index=False)
+
+    if not aucs_gbsp:
+        print(f"\n[WARNING] All {n_splits} folds for {family} were skipped -- every fold's "
+              f"test set produced fewer than {MIN_CLASS_COUNT} positive or fewer than "
+              f"{MIN_CLASS_COUNT} negative residue positions, so no fold had enough "
+              "signal to score reliably. All metrics below will be NaN.")
+        for reason in skipped_fold_reasons:
+            print(f"    skipped {reason}")
+        print("  Likely cause: cluster-size imbalance starving GroupKFold of diverse test "
+              "sets (a fold whose test sequences are nearly identical to the reference "
+              "produces ~0 positive positions; a fold dominated by one huge cluster can "
+              "produce the opposite extreme). Try: --split-method random to check if this "
+              "is a clustering artifact, or --cluster-identity 0.5/0.7 to rebalance cluster "
+              "sizes, or --folds 3 to use larger/coarser folds.")
 
     mean_auc = float(np.mean(aucs_gbsp)) if aucs_gbsp else float("nan")
     std_auc = float(np.std(aucs_gbsp)) if aucs_gbsp else float("nan")
@@ -1128,10 +1232,15 @@ def main() -> int:
     summary = {
         "family": family,
         "split_method": args.split_method,
+        "biophysical_weight_used": biophysical_weight,
+        "biophysical_weight_source": weight_source,
         "n_folds": len(aucs_gbsp),
         "n_sequences": len(family_seq_ids),
         "n_clusters_family": len(cluster_sizes) if cluster_sizes else 0,
         "median_cluster_size": median_cluster_size,
+        "max_cluster_size": max_cluster_size,
+        "max_cluster_fraction": max_cluster_fraction,
+        "n_folds_skipped": len(skipped_fold_reasons),
         # GBSP
         "gbsp_mean_roc_auc": mean_auc,
         "gbsp_std_roc_auc": std_auc,
@@ -1239,9 +1348,23 @@ def main() -> int:
     if not np.isnan(median_cluster_size) and median_cluster_size == 1:
         print("  - median_cluster_size=1: clustering is fragmented for this family; "
               "retry fetch/cluster step with --cluster-identity 0.5 and 0.7 and compare.")
+    if not np.isnan(max_cluster_fraction) and max_cluster_fraction > 0.40:
+        print(f"  - one cluster holds {max_cluster_fraction:.0%} of all {family} sequences "
+              f"({max_cluster_size}/{len(family_seq_ids)}): GroupKFold will frequently put this "
+              "whole supercluster in a single fold, starving other folds of train/test diversity "
+              "and risking degenerate (all-same-label) folds. Consider --cluster-identity 0.5/0.7 "
+              "to split this cluster into smaller, more homogeneous sub-clusters.")
+    if not aucs_gbsp:
+        print(f"  - 0/{n_splits} folds had enough class balance to score (see [WARNING] above): "
+              "results for this family/split are unusable as-is. Address the cluster-imbalance "
+              "or dataset-size issues above before trusting any number from this run.")
     if not np.isnan(mean_auc_knn) and abs(mean_auc - mean_auc_knn) < 0.02:
         print("  - |GBSP-KNN| < 0.02: graph propagation adds negligible value over "
               "naive k=1 similarity search for this family.")
+    if len(aucs_gbsp) == 1:
+        print("  - Only 1/{} folds produced a usable score: the reported GBSP/KNN ROC-AUC is a "
+              "single point estimate, not a mean -- treat std=0.0000 as 'undefined', not "
+              "'perfectly stable'. Do not report this number without that caveat.".format(n_splits))
 
     # Isolate whether the FIXED 0.90/0.10 weighting or PROPAGATION ITSELF
     # is responsible for any GBSP underperformance vs the LR ablations.
