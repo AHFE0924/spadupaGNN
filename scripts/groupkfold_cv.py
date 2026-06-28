@@ -162,6 +162,34 @@ _CANONICAL_VARIANT = {
     SIM_FAMILY: "SIM-1",
 }
 
+# Expected mature-form sequence length per B1 MBL family (residues).
+# Sources: UniProt canonical entries + crystal structures:
+#   NDM: P0A6X7 / 3SPU — 270 aa mature form (Yong et al. 2009)
+#   VIM: Q9KIN3 / 1KO3 — 228 aa (Poirel et al. 2000)
+#   IMP: P52699 / 1DDK — 228 aa (Osano et al. 1994)
+#   SPM: Q8GRQ4 / 1X8I — 228 aa (Toleman et al. 2002)
+#   GIM: Q5FAK0        — 235 aa (Castanheira et al. 2004)
+#   SIM: B2ZEI2        — 232 aa (Lee et al. 2005)
+# Used to filter out multi-domain proteins, fusion proteins, and fragments
+# that share a family keyword but are not genuine B1 MBL sequences.
+_FAMILY_EXPECTED_LENGTH: Dict[str, int] = {
+    NDM_FAMILY: 270,
+    VIM_FAMILY: 228,
+    IMP_FAMILY: 228,
+    SPM_FAMILY: 228,
+    GIM_FAMILY: 235,
+    SIM_FAMILY: 232,
+}
+
+# Sequences outside [expected * LO_FRAC, expected * HI_FRAC] are discarded
+# as likely contaminants (fragments, precursor forms, multi-domain proteins).
+# LO=0.60 keeps sequences down to ~137 aa (allows short mature-form variants
+# and slightly truncated deposits); HI=1.50 keeps sequences up to ~405 aa
+# (allows the full precursor/signal-peptide-included form at ~25-30 extra aa,
+# plus some slack for annotation variation) while excluding the 460–1054 aa
+# multi-domain proteins that were contaminating IMP and VIM.
+LENGTH_FILTER_LO = 0.60
+LENGTH_FILTER_HI = 1.50
 
 def family_from_header(header: str) -> Optional[str]:
     """Classify a UniProt FASTA header into one of the 6 B1 MBL families.
@@ -196,62 +224,44 @@ def choose_reference(
     family: str,
     family_assignments: Optional[Dict[str, int]] = None,
 ) -> SeqIO.SeqRecord:
-    """Pick a reference sequence to align/score the rest of the family against.
+    """Pick the reference sequence to align/score the rest of the family against.
 
     Priority:
-      1. The LONGEST canonical named variant (e.g. "NDM-1") if present
-         anywhere in records -- most semantically meaningful when available.
-      2. The LONGEST sequence from the LARGEST DIAMOND cluster among this
-         family's own sequences (family_assignments), since DIAMOND already
-         grouped mutually similar sequences together -- the biggest cluster
-         is the most "central"/representative subset of the family's
-         diversity.
-      3. The LONGEST sequence in `records` overall as an absolute last
-         resort if no cluster info is given.
+      1. Canonical named variant (e.g. "NDM-1") closest to expected mature
+         length -- most semantically meaningful when present.
+      2. Sequence from the LARGEST DIAMOND cluster closest to expected mature
+         length -- largest cluster is most representative; length proximity
+         avoids picking a multi-domain or fragment outlier.
+      3. Sequence in `records` closest to expected mature length overall.
 
-    BUG FIX (round 1): this previously fell back straight to records[0]
-    (just the first sequence in FASTA file order -- essentially arbitrary)
-    whenever no canonical variant was found. Picking an outlier/divergent
-    sequence as reference makes nearly every OTHER sequence look "different
-    everywhere" against it under global alignment. That is exactly what
-    caused IMP's fold labels to come back with ~246/246 positions flagged
-    as variant in every single fold -- not real biological diversity, just
-    a bad alignment anchor producing near-universal mismatches.
-
-    BUG FIX (round 2): anchoring to "the largest cluster" alone was not
-    enough -- it still grabbed the FIRST record found in that cluster, which
-    can easily be a short/partial deposit (DIAMOND clusters sequences by
-    local similarity over their overlapping region, so a fragment can land
-    in the same cluster as full-length sequences despite covering only part
-    of the protein). Picking a short fragment as reference still produces
-    low alignment coverage for the rest of the family. This is exactly what
-    explained IMP (mean coverage 0.48) and VIM (mean coverage 0.41) -- most
-    of each family didn't even align to 70% of the chosen reference. Now
-    picks the LONGEST sequence within whichever tier applies, since a
-    longer sequence is far more likely to be the full-length mature protein
-    that most other family members can align well against.
+    BUG HISTORY:
+      v1: records[0] -- arbitrary file order, caused near-universal mismatches.
+      v2: longest in each tier -- caused IMP reference to be 889 aa (a
+          multi-domain contaminator), dropping mean alignment coverage to 0.27.
+      v3 (this): closest to expected mature length within each tier -- avoids
+          both fragment and multi-domain extremes.
     """
-    def _longest(candidates: List[SeqIO.SeqRecord]) -> SeqIO.SeqRecord:
-        return max(candidates, key=lambda r: len(str(r.seq)))
+    expected = _FAMILY_EXPECTED_LENGTH.get(family.upper(), 250)
+
+    def _closest(candidates: List[SeqIO.SeqRecord]) -> SeqIO.SeqRecord:
+        return min(candidates, key=lambda r: abs(len(str(r.seq)) - expected))
 
     canonical = _CANONICAL_VARIANT.get(family.upper())
     if canonical:
         pattern = re.compile(re.escape(canonical) + r"\b", re.I)
-        canonical_matches = [rec for rec in records if pattern.search(rec.description)]
-        if canonical_matches:
-            return _longest(canonical_matches)
+        matches = [rec for rec in records if pattern.search(rec.description)]
+        if matches:
+            return _closest(matches)
 
     if family_assignments:
         cluster_sizes = Counter(family_assignments.values())
         if cluster_sizes:
-            largest_cluster_id, _largest_size = cluster_sizes.most_common(1)[0]
-            cluster_matches = [
-                rec for rec in records if family_assignments.get(rec.id) == largest_cluster_id
-            ]
-            if cluster_matches:
-                return _longest(cluster_matches)
+            largest_id, _ = cluster_sizes.most_common(1)[0]
+            cluster_recs = [r for r in records if family_assignments.get(r.id) == largest_id]
+            if cluster_recs:
+                return _closest(cluster_recs)
 
-    return _longest(records)
+    return _closest(list(records))
 
 
 def align_reference_to_query(reference: str, query: str) -> Dict[int, Optional[int]]:
@@ -1001,12 +1011,34 @@ def main() -> int:
             "this family (re-run fetch_b1_superfamily.py with --families including it)."
         )
 
-    # Length-distribution diagnostic: a wide spread (e.g. 150-400 residues)
-    # signals mixed precursor (signal-peptide-included) vs. mature-form
-    # deposits, or genuine fragments, sitting in the same family bucket --
-    # this alone can explain low alignment coverage regardless of which
-    # reference is picked, since no single sequence will represent both a
-    # 150-residue mature protein and a 400-residue precursor well.
+    # Length filter: discard sequences outside the expected mature-form range
+    # for this family. This removes multi-domain/fusion proteins (too long)
+    # and fragments (too short) that were classified as family members by the
+    # header regex but are not real B1 MBL sequences. Without this filter,
+    # IMP pulled in sequences up to 889 aa (expected ~228 aa), and VIM up to
+    # 1054 aa (expected ~228 aa), causing near-universal alignment failure.
+    expected_len = _FAMILY_EXPECTED_LENGTH.get(family, 250)
+    lo = int(expected_len * LENGTH_FILTER_LO)
+    hi = int(expected_len * LENGTH_FILTER_HI)
+    records_before = len(records)
+    records = [r for r in records if lo <= len(str(r.seq)) <= hi]
+    n_dropped = records_before - len(records)
+    if n_dropped:
+        print(
+            f"[{family}] length filter [{lo}–{hi} aa = {LENGTH_FILTER_LO:.0%}–"
+            f"{LENGTH_FILTER_HI:.0%} × expected {expected_len} aa]: "
+            f"kept {len(records)}/{records_before} sequences, "
+            f"dropped {n_dropped} outliers (fragments / multi-domain / precursors)"
+        )
+    if not records:
+        raise SystemExit(
+            f"No {family} sequences survived the length filter [{lo}–{hi} aa]. "
+            "The fetched dataset may be heavily contaminated -- re-run "
+            "fetch_b1_superfamily.py with --min-length and --max-length set "
+            f"to approximately {lo} and {hi}."
+        )
+
+    # Length-distribution diagnostic on the FILTERED dataset
     family_lengths = sorted(len(str(r.seq)) for r in records)
     if family_lengths:
         n = len(family_lengths)
@@ -1014,20 +1046,10 @@ def main() -> int:
         p50 = family_lengths[n // 2]
         p75 = family_lengths[min(n - 1, 3 * n // 4)]
         print(
-            f"[{family}] sequence length distribution: "
+            f"[{family}] sequence length distribution (after filter): "
             f"min={family_lengths[0]}, p25={p25}, median={p50}, p75={p75}, "
             f"max={family_lengths[-1]}  (n={n})"
         )
-        if family_lengths[-1] > 0 and family_lengths[0] / family_lengths[-1] < 0.6:
-            print(
-                f"  [WARNING] length spread is wide (min/max ratio "
-                f"{family_lengths[0] / family_lengths[-1]:.2f}): likely mixed "
-                "precursor/mature-form or fragment deposits in this family's "
-                "fetched sequences. Picking a longer reference helps but may "
-                "not fully fix alignment coverage -- consider --min-length / "
-                "--max-length filters in fetch_b1_superfamily.py to tighten "
-                "the length range before re-fetching, or --exclude-fragments."
-            )
 
     # ------------------------------------------------------------------
     # Clustering (moved before reference selection: choose_reference now
