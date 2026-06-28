@@ -1,1591 +1,314 @@
 #!/usr/bin/env python3
-"""Group K-Fold evaluation with sequence clustering to avoid leakage.
+"""Utility functions for sequence clustering.
 
-Clusters sequences at a specified identity threshold and performs GroupKFold
-splits so sequences from the same cluster never appear in both train and test.
-Outputs mean/std ROC-AUC across folds and plots ROC/PR curves.
+Supports DIAMOND (recommended), cd-hit, or a greedy Biopython alignment
+fallback for smaller datasets.
 
-Method: Graph-Based Score Propagation (GBSP)
---------------------------------------------
-This is NOT a trained GNN.  There are no learnable parameters.  Instead,
-per-residue ESM-2 embedding variance is computed across training sequences
-and smoothed over a graph via iterative propagation.  A biophysical proximity
-term (distance to known active-site residues, weighted 0.10) biases scores
-toward functionally important regions.
-
-Graph construction (structure-based with chain fallback)
---------------------------------------------------------
-When an AlphaFold structure is available for the reference family, the graph
-adjacency is built from Cα–Cα contacts at ≤8 Å.  This captures long-range
-contacts that the chain graph (±5 residue window) misses — critical for enzyme
-active sites where catalytic residues are often sequence-distant but spatially
-adjacent.  If no structure can be downloaded (network error, unknown family),
-the script falls back to the ±5 chain graph automatically.
-
-AlphaFold structures are downloaded once and cached in --structure-dir.
-
-ESM-2 model choice (esm2_t33_650M_UR50D -- 650 million parameters)
---------------------------------------------------------------------
-The 650M model is used rather than the smaller 150M or larger 3B variants
-for the following reasons:
-
-  * Dataset scale: B1 MBL families (NDM, VIM, IMP, etc.) have on the order
-    of hundreds to low-thousands of sequences, with proteins ~200–330
-    residues.  The 650M model provides 1280-dimensional per-residue
-    embeddings that are empirically rich enough to resolve fine-grained
-    mutational variation at this scale without overfitting the downstream
-    scoring.
-
-  * Embedding dimensionality vs. dataset size trade-off: The 3B model yields
-    2560-dimensional embeddings.  For a dataset this size the additional
-    dimensions are unlikely to improve positional variance estimates and
-    substantially increase GPU memory and inference time.  The 150M model
-    (480-dim) has been shown to lose resolution on catalytic-site residues in
-    enzyme families.
-
-  * Precedent: Lin et al. (2023, Science) demonstrate that 650M strikes the
-    best accuracy/cost trade-off for per-residue tasks on bacterial proteins.
-
-Active site residues (BBL standard numbering, all B1 subclass)
---------------------------------------------------------------
-Zinc-coordinating residues used for the biophysical proximity term.
-All positions are in BBL standard numbering (Garau et al. 2004).
-
-  NDM: Zn1: His116, His118, His196
-       Zn2: Asp120, Cys221, His263
-       Sources: Marcoccia et al. 2018 (AAC); Llarrull et al. 2011
-
-  VIM: Zn1: His116, His118, His196
-       Zn2: Asp120, Cys221, His263
-       Sources: Garcìa-Saez et al. 2008 (FEBS); Garau et al. 2004
-
-  IMP: Zn1: His77,  His79,  His139
-       Zn2: Asp81,  Cys158, His197
-       Sources: Concha et al. 2000 (JACS); Moali et al. 2003
-
-  SPM: Zn1: His116, His118, His196
-       Zn2: Asp120, Cys221, His263
-       Source:  Murphy et al. 2006 (JMB) -- same B1 motif as NDM/VIM
-
-  GIM: Zn1: His116, His118, His196
-       Zn2: Asp120, Cys221, His263
-       Source:  Leiros et al. 2012 (AAC) -- confirmed same B1 motif
-
-  SIM: Zn1: His116, His118, His196
-       Zn2: Asp120, Cys221, His263
-       Source:  by structural homology to VIM (>60% identity)
-
-Note: IMP uses a different set of BBL numbers for its Zn1 site (His77/79/139)
-because IMP enzymes have a shorter N-terminal region relative to NDM/VIM.
-All other B1 families share the His116/118/196 + Asp120/Cys221/His263 motif.
-
-Positions are mapped to 0-indexed reference-sequence coordinates via pairwise
-alignment before use.  The biophysical weight is 0.10 so the variance-
-propagation signal dominates.
-
-KNN baseline
-------------
-A k=1 nearest-neighbour baseline (in ESM-2 embedding space) is evaluated
-alongside GBSP every fold per ORNL recommendation.  The KNN baseline uses
-mean per-residue cosine distance from each test sequence to its single
-closest training neighbour to rank residue positions.
+Clustering method priority (when method="auto"):
+  1. DIAMOND  -- BLOSUM-based, handles variable/mutatable residues correctly
+  2. cd-hit   -- fast identity clustering, good fallback if DIAMOND absent
+  3. greedy   -- pure-Python pairwise alignment, slow but zero dependencies
 """
 from __future__ import annotations
 
-import argparse
-import os
 import re
-import sys
+import shutil
+import subprocess
+import tempfile
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
-
-import numpy as np
-import pandas as pd
-
-# Ensure repo root and scripts directory are on sys.path.
-REPO_ROOT = Path(__file__).resolve().parents[1]
-SCRIPTS_DIR = REPO_ROOT / "scripts"
-for path in (str(REPO_ROOT), str(SCRIPTS_DIR)):
-    if path not in sys.path:
-        sys.path.insert(0, path)
-
-# Avoid auto-running the full pipeline when importing _run_pipeline.
-os.environ.setdefault("SPADUPA_DISABLE_AUTORUN", "1")
+from typing import Dict, Iterable, List, Optional, Tuple
 
 from Bio import SeqIO
-from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import (
-    average_precision_score,
-    precision_recall_curve,
-    roc_auc_score,
-    roc_curve,
-)
-from sklearn.model_selection import GroupKFold, KFold, StratifiedKFold
-
-from cluster_utils import (
-    greedy_cluster,
-    load_cluster_csv,
-    read_fasta_records,
-    run_clustering,
-    write_cluster_csv,
-)
-from collections import Counter
+from Bio.Align import PairwiseAligner
 
 
-NDM_FAMILY = "NDM"
-VIM_FAMILY = "VIM"
-IMP_FAMILY = "IMP"
-SPM_FAMILY = "SPM"
-GIM_FAMILY = "GIM"
-SIM_FAMILY = "SIM"
-ALL_FAMILIES = [NDM_FAMILY, VIM_FAMILY, IMP_FAMILY, SPM_FAMILY, GIM_FAMILY, SIM_FAMILY]
-
-# Minimum number of positive AND negative residue positions required for a
-# fold's labels to be considered meaningful. The old guard only skipped
-# folds with LITERALLY 0% or 100% positive positions, which let through
-# near-degenerate folds (e.g. 2 positives out of 270 positions) that can
-# produce a spuriously perfect ROC-AUC by chance rather than real signal.
-# Used consistently by both the main GBSP/KNN scoring loop AND the LR
-# ablation, so all three methods are scored on the same set of folds and
-# their deltas stay comparable (previously LR silently bailed to NaN on
-# fold class-imbalance while GBSP/KNN scored the same degenerate fold
-# anyway, producing misleading "perfect" results -- see IMP "1.0 ± 0.0").
-MIN_CLASS_COUNT = 5
-
-# Canonical reference variant per family, used by choose_reference() below.
-_CANONICAL_VARIANT = {
-    NDM_FAMILY: "NDM-1",
-    VIM_FAMILY: "VIM-1",
-    IMP_FAMILY: "IMP-1",
-    SPM_FAMILY: "SPM-1",
-    GIM_FAMILY: "GIM-1",
-    SIM_FAMILY: "SIM-1",
-}
-
-# Expected mature-form sequence length per B1 MBL family (residues).
-# Sources: UniProt canonical entries + crystal structures:
-#   NDM: P0A6X7 / 3SPU — 270 aa mature form (Yong et al. 2009)
-#   VIM: Q9KIN3 / 1KO3 — 228 aa (Poirel et al. 2000)
-#   IMP: P52699 / 1DDK — 228 aa (Osano et al. 1994)
-#   SPM: Q8GRQ4 / 1X8I — 228 aa (Toleman et al. 2002)
-#   GIM: Q5FAK0        — 235 aa (Castanheira et al. 2004)
-#   SIM: B2ZEI2        — 232 aa (Lee et al. 2005)
-# Used to filter out multi-domain proteins, fusion proteins, and fragments
-# that share a family keyword but are not genuine B1 MBL sequences.
-_FAMILY_EXPECTED_LENGTH: Dict[str, int] = {
-    NDM_FAMILY: 270,
-    VIM_FAMILY: 228,
-    IMP_FAMILY: 228,
-    SPM_FAMILY: 228,
-    GIM_FAMILY: 235,
-    SIM_FAMILY: 232,
-}
-
-# Sequences outside [expected * LO_FRAC, expected * HI_FRAC] are discarded
-# as likely contaminants (fragments, precursor forms, multi-domain proteins).
-# LO=0.60 keeps sequences down to ~137 aa (allows short mature-form variants
-# and slightly truncated deposits); HI=1.50 keeps sequences up to ~405 aa
-# (allows the full precursor/signal-peptide-included form at ~25-30 extra aa,
-# plus some slack for annotation variation) while excluding the 460–1054 aa
-# multi-domain proteins that were contaminating IMP and VIM.
-LENGTH_FILTER_LO = 0.60
-LENGTH_FILTER_HI = 1.50
-
-def family_from_header(header: str) -> Optional[str]:
-    """Classify a UniProt FASTA header into one of the 6 B1 MBL families.
-
-    BUG FIX: the previous version only recognized NDM/VIM/IMP -- SPM, GIM,
-    and SIM always returned None, meaning `--family SPM` (etc.) would always
-    raise "No sequences found", and the family was silently unusable.
-
-    BUG FIX: the previous NDM/VIM/IMP patterns required a digit immediately
-    after the family code (e.g. "NDM-1", "VIM-2"), missing headers that
-    mention the family name without a trailing variant number (e.g. a
-    generic "NDM-type metallo-beta-lactamase" protein name) -- undercounting
-    real family members and explaining unexpectedly low n_sequences.
-
-    Matching strategy: for each family code FFF, search for an optional
-    "BLA"/"BLA-" prefix (covers gene names like "blaNDM-1" glued with no
-    separator) followed by FFF, requiring a word boundary immediately AFTER
-    the code (e.g. "NDM" followed by "-", a digit, a space, or end of
-    string) -- this still excludes accidental substring matches such as
-    "IMP" inside "IMPORTANT" or "IMPDH", but no longer requires a trailing
-    digit, so genuine family members get correctly counted.
-    """
-    text = header.upper()
-    for fam in ALL_FAMILIES:
-        if re.search(rf"(?:BLA-?)?{fam}\b", text):
-            return fam
-    return None
+@dataclass
+class ClusterResult:
+    assignments: Dict[str, int]
+    cluster_count: int
+    method: str
+    clstr_path: Optional[Path] = None
 
 
-def choose_reference(
-    records: Sequence[SeqIO.SeqRecord],
-    family: str,
-    family_assignments: Optional[Dict[str, int]] = None,
-) -> SeqIO.SeqRecord:
-    """Pick the reference sequence to align/score the rest of the family against.
-
-    Priority:
-      1. Canonical named variant (e.g. "NDM-1") closest to expected mature
-         length -- most semantically meaningful when present.
-      2. Sequence from the LARGEST DIAMOND cluster closest to expected mature
-         length -- largest cluster is most representative; length proximity
-         avoids picking a multi-domain or fragment outlier.
-      3. Sequence in `records` closest to expected mature length overall.
-
-    BUG HISTORY:
-      v1: records[0] -- arbitrary file order, caused near-universal mismatches.
-      v2: longest in each tier -- caused IMP reference to be 889 aa (a
-          multi-domain contaminator), dropping mean alignment coverage to 0.27.
-      v3 (this): closest to expected mature length within each tier -- avoids
-          both fragment and multi-domain extremes.
-    """
-    expected = _FAMILY_EXPECTED_LENGTH.get(family.upper(), 250)
-
-    def _closest(candidates: List[SeqIO.SeqRecord]) -> SeqIO.SeqRecord:
-        return min(candidates, key=lambda r: abs(len(str(r.seq)) - expected))
-
-    canonical = _CANONICAL_VARIANT.get(family.upper())
-    if canonical:
-        pattern = re.compile(re.escape(canonical) + r"\b", re.I)
-        matches = [rec for rec in records if pattern.search(rec.description)]
-        if matches:
-            return _closest(matches)
-
-    if family_assignments:
-        cluster_sizes = Counter(family_assignments.values())
-        if cluster_sizes:
-            largest_id, _ = cluster_sizes.most_common(1)[0]
-            cluster_recs = [r for r in records if family_assignments.get(r.id) == largest_id]
-            if cluster_recs:
-                return _closest(cluster_recs)
-
-    return _closest(list(records))
+def read_fasta_records(fasta_path: str) -> List[SeqIO.SeqRecord]:
+    return list(SeqIO.parse(fasta_path, "fasta-pearson"))
 
 
-def align_reference_to_query(reference: str, query: str) -> Dict[int, Optional[int]]:
-    from Bio.Align import PairwiseAligner
-
-    if reference == query:
-        return {i: i for i in range(len(reference))}
-
+def sequence_identity(seq_a: str, seq_b: str) -> float:
+    """Compute global alignment identity as matches / alignment length."""
+    if seq_a == seq_b:
+        return 1.0
     aligner = PairwiseAligner()
     aligner.mode = "global"
     aligner.match_score = 1.0
-    aligner.mismatch_score = -1.0
-    aligner.open_gap_score = -0.5
-    aligner.extend_gap_score = -0.1
-    alignment = aligner.align(reference, query)[0]
-
-    mapping: Dict[int, Optional[int]] = {i: None for i in range(len(reference))}
-    ref_blocks, query_blocks = alignment.aligned
-    for (r0, r1), (q0, q1) in zip(ref_blocks, query_blocks):
-        for r_i, q_i in zip(range(r0, r1), range(q0, q1)):
-            mapping[r_i] = q_i
-    return mapping
+    aligner.mismatch_score = 0.0
+    aligner.open_gap_score = 0.0
+    aligner.extend_gap_score = 0.0
+    alignment = aligner.align(seq_a, seq_b)[0]
+    matches = sum(a == b for a, b in zip(*alignment))
+    return matches / max(1, alignment.length)
 
 
-def alignment_coverage(reference: str, query: str) -> float:
-    """Fraction of reference positions that successfully align to a
-    non-gap position in query. Used to detect fragment/precursor-mismatched
-    sequences before they're allowed to contribute to variant labeling."""
-    mapping = align_reference_to_query(reference, query)
-    if not mapping:
-        return 0.0
-    n_mapped = sum(1 for v in mapping.values() if v is not None)
-    return n_mapped / len(mapping)
+def greedy_cluster(records: Iterable[SeqIO.SeqRecord], identity: float) -> ClusterResult:
+    clusters: List[Tuple[str, str]] = []
+    assignments: Dict[str, int] = {}
 
+    for rec in records:
+        seq = str(rec.seq)
+        assigned = False
+        for cluster_id, (rep_id, rep_seq) in enumerate(clusters):
+            if sequence_identity(seq, rep_seq) >= identity:
+                assignments[rec.id] = cluster_id
+                assigned = True
+                break
+        if not assigned:
+            clusters.append((rec.id, seq))
+            assignments[rec.id] = len(clusters) - 1
 
-# Sequences whose alignment to the reference covers less than this fraction
-# of reference positions are excluded from contributing to variant-position
-# labels (see project_variant_positions). Below this threshold, a sequence
-# is more likely a fragment, precursor (signal-peptide-included) entry, or
-# otherwise structurally mismatched to the reference than a genuine
-# full-length homolog with real biological indels -- without this filter,
-# ONE such sequence in a test fold can mark nearly the entire reference as
-# "variant" via unmapped (gap) positions, which is an alignment artifact,
-# not evidence of mutation tolerance.
-MIN_ALIGNMENT_COVERAGE = 0.70
-
-
-def project_variant_positions(reference: str, query: str) -> List[int]:
-    """Reference positions where `query` carries a genuine amino-acid
-    substitution relative to `reference`.
-
-    BUG FIX: the previous version also flagged any position where `query`
-    didn't align at all (a gap, query_idx is None) as "variant" -- this
-    conflates "this position differs" with "this sequence doesn't cover
-    this position" (e.g. due to a missing signal peptide, a fragment
-    deposit, or a large indel elsewhere shifting the alignment). A single
-    low-coverage sequence in a test fold could therefore mark almost the
-    entire reference as variant, regardless of real biology. Gaps are now
-    excluded entirely (neither positive nor negative) rather than counted
-    as positive. Combine with alignment_coverage()/MIN_ALIGNMENT_COVERAGE to
-    filter out low-coverage sequences before calling this function at all.
-    """
-    mapping = align_reference_to_query(reference, query)
-    variant_positions: List[int] = []
-    for ref_idx, query_idx in mapping.items():
-        if query_idx is None or ref_idx >= len(reference) or query_idx >= len(query):
-            continue
-        if reference[ref_idx] != query[query_idx]:
-            variant_positions.append(ref_idx)
-    return sorted(set(variant_positions))
-
-
-def project_embeddings_to_reference(
-    reference: str,
-    query: str,
-    query_embedding: np.ndarray,
-) -> Dict[int, np.ndarray]:
-    mapping = align_reference_to_query(reference, query)
-    projected: Dict[int, np.ndarray] = {}
-    for ref_idx, query_idx in mapping.items():
-        if query_idx is not None and 0 <= query_idx < len(query_embedding):
-            projected[ref_idx] = query_embedding[query_idx]
-    return projected
+    return ClusterResult(assignments=assignments, cluster_count=len(clusters), method="greedy")
 
 
 # ---------------------------------------------------------------------------
-# Active site residues in BBL standard numbering (1-indexed, as in literature)
-# Mapped to 0-indexed reference coordinates at runtime via pairwise alignment.
+# DIAMOND clustering
 # ---------------------------------------------------------------------------
 
-# All B1 families share the same zinc-binding motif except IMP, which has a
-# shorter N-terminal region causing a different BBL numbering for its Zn1 site.
-_ACTIVE_SITE_BBL: Dict[str, List[int]] = {
-    # Zn1: His116, His118, His196 | Zn2: Asp120, Cys221, His263
-    "NDM": [116, 118, 120, 196, 221, 263],
-    "VIM": [116, 118, 120, 196, 221, 263],
-    "SPM": [116, 118, 120, 196, 221, 263],
-    "GIM": [116, 118, 120, 196, 221, 263],
-    "SIM": [116, 118, 120, 196, 221, 263],
-    # IMP Zn1: His77, His79, His139 | Zn2: Asp81, Cys158, His197
-    "IMP": [77, 79, 81, 139, 158, 197],
-}
+def run_diamond(
+    fasta_path: str,
+    output_prefix: str,
+    identity: float,
+    coverage: float = 0.8,
+    sensitivity: str = "--sensitive",
+) -> ClusterResult:
+    """Cluster sequences using DIAMOND's BLOSUM-based all-vs-all search.
 
+    DIAMOND is preferred over CD-HIT because its BLOSUM62 scoring matrix
+    accounts for biochemically conservative substitutions at easily-mutated
+    residues -- directly relevant for metallo-beta-lactamase variant analysis.
+    See: Buchfink et al. (2021) Nature Methods; precedent in MBL literature.
 
-def get_active_site_positions(family: str, ref_seq: str) -> List[int]:
-    """Map BBL active-site residue numbers to 0-indexed reference positions.
+    Parameters
+    ----------
+    fasta_path:  Input FASTA file.
+    output_prefix: Path prefix for intermediate and output files.
+    identity:    Minimum sequence identity (0–1) for two sequences to share
+                 a cluster.  Translated to a percentage for DIAMOND's
+                 --id flag.
+    coverage:    Minimum query/subject coverage (0–1).  Default 0.8.
+    sensitivity: DIAMOND sensitivity flag.  '--sensitive' is a good default;
+                 use '--more-sensitive' for highly diverged sequences.
 
-    BBL numbers are 1-indexed and refer to a canonical alignment position, not
-    raw sequence index.  We approximate by taking the BBL number as a 1-indexed
-    sequence position (subtracting 1 for 0-indexing) and clamping to the
-    reference length.  This is a close approximation for mature B1 MBL sequences
-    that start near residue 1 in BBL numbering.
+    Returns
+    -------
+    ClusterResult with method="diamond".
     """
-    bbl_positions = _ACTIVE_SITE_BBL.get(family.upper(), [116, 118, 120, 196, 221, 263])
-    n = len(ref_seq)
-    return [min(p - 1, n - 1) for p in bbl_positions if p - 1 < n]
+    diamond = shutil.which("diamond")
+    if not diamond:
+        raise FileNotFoundError("DIAMOND not found on PATH. Install with: conda install -c bioconda diamond")
+
+    prefix = Path(output_prefix)
+    prefix.parent.mkdir(parents=True, exist_ok=True)
+
+    db_path = prefix.with_suffix(".dmnd")
+    hits_path = prefix.with_suffix(".tsv")
+
+    # Build DIAMOND protein database
+    subprocess.check_call(
+        [diamond, "makedb", "--in", fasta_path, "--db", str(db_path)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+    # All-vs-all search with BLOSUM62
+    subprocess.check_call(
+        [
+            diamond, "blastp",
+            "--db", str(db_path),
+            "--query", fasta_path,
+            "--out", str(hits_path),
+            "--outfmt", "6", "qseqid", "sseqid", "pident", "qcovhsp", "scovhsp",
+            "--id", str(identity * 100),
+            "--query-cover", str(coverage * 100),
+            "--subject-cover", str(coverage * 100),
+            sensitivity,
+            "--no-self-hits",
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+    assignments = _parse_diamond_hits_to_clusters(hits_path, fasta_path)
+    return ClusterResult(
+        assignments=assignments,
+        cluster_count=len(set(assignments.values())),
+        method="diamond",
+        clstr_path=hits_path,
+    )
 
 
-
-
-# ---------------------------------------------------------------------------
-# AlphaFold structure-based contact map
-# ---------------------------------------------------------------------------
-
-# Verified PDB IDs for canonical B1 MBL reference structures (experimental).
-# Crystal structures are preferred over AlphaFold for these well-characterized
-# proteins as they have experimental validation and stable accession IDs.
-#   NDM: 3SPU  NDM-1, E. coli,          1.90 Å  (Tesar et al. 2011)
-#   VIM: 1KO3  VIM-2, P. aeruginosa,    1.85 Å  (Garcia-Saez et al. 2008)
-#   IMP: 1DDK  IMP-1, P. aeruginosa,    2.20 Å  (Concha et al. 2000)
-#   SPM: 1X8I  SPM-1, P. aeruginosa,    2.30 Å  (Murphy et al. 2006)
-# GIM and SIM have no deposited crystal structures — chain graph fallback used.
-_FAMILY_PDB: Dict[str, str] = {
-    "NDM": "3SPU",
-    "VIM": "1KO3",
-    "IMP": "1DDK",
-    "SPM": "1X8I",
-}
-
-
-def fetch_rcsb_pdb(pdb_id: str, cache_dir: Path) -> Optional[Path]:
-    """Download a PDB file from RCSB, caching locally.
-
-    URL: https://files.rcsb.org/download/{pdb_id}.pdb
-    Returns None on failure so callers can fall back gracefully.
-    """
-    import urllib.request as _ureq
-
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    pdb_path = cache_dir / f"{pdb_id.upper()}.pdb"
-    if pdb_path.exists():
-        return pdb_path
-    url = f"https://files.rcsb.org/download/{pdb_id.upper()}.pdb"
-    try:
-        _ureq.urlretrieve(url, str(pdb_path))
-        print(f"Downloaded PDB structure: {pdb_id.upper()}.pdb")
-        return pdb_path
-    except Exception as exc:
-        print(f"Warning: PDB download failed for {pdb_id} ({exc}). Using chain graph fallback.")
-        return None
-
-
-def parse_ca_coords(pdb_path: Path) -> np.ndarray:
-    """Extract Cα coordinates from a PDB file (first chain only).
-
-    Returns array of shape (n_residues, 3), one row per unique residue.
-    """
-    coords: List[List[float]] = []
-    seen: set = set()
-    with pdb_path.open("r") as fh:
+def _parse_diamond_hits_to_clusters(hits_path: Path, fasta_path: str) -> Dict[str, int]:
+    """Single-linkage clustering from DIAMOND all-vs-all hits."""
+    # Build adjacency list from hits
+    edges: Dict[str, List[str]] = {}
+    with hits_path.open("r", encoding="utf-8") as fh:
         for line in fh:
-            if not line.startswith("ATOM"):
+            parts = line.strip().split("\t")
+            if len(parts) < 2:
                 continue
-            atom_name = line[12:16].strip()
-            if atom_name != "CA":
-                continue
-            chain = line[21]
-            res_seq = line[22:26].strip()
-            key = (chain, res_seq)
-            if key in seen:
-                continue
-            seen.add(key)
-            try:
-                x, y, z = float(line[30:38]), float(line[38:46]), float(line[46:54])
-            except ValueError:
-                continue
-            coords.append([x, y, z])
-    return np.array(coords, dtype=np.float32)
+            q, s = parts[0], parts[1]
+            edges.setdefault(q, []).append(s)
+            edges.setdefault(s, []).append(q)
 
+    # Union-Find for connected components
+    records = read_fasta_records(fasta_path)
+    all_ids = [rec.id for rec in records]
+    parent = {seq_id: seq_id for seq_id in all_ids}
 
-def build_contact_map_from_coords(coords: np.ndarray, threshold: float = 8.0) -> np.ndarray:
-    """Binary Cα–Cα contact map: 1 if distance ≤ threshold Å, else 0.
+    def find(x: str) -> str:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
 
-    8 Å is the standard threshold used in structural bioinformatics for
-    protein contact maps (e.g., Dunn et al. 2008; Marks et al. 2011).
-    """
-    diff = coords[:, np.newaxis, :] - coords[np.newaxis, :, :]   # (n, n, 3)
-    dist = np.sqrt((diff ** 2).sum(axis=-1))                       # (n, n)
-    contacts = (dist <= threshold).astype(np.float32)
-    return contacts
+    def union(x: str, y: str) -> None:
+        parent[find(x)] = find(y)
 
-
-def build_structure_graph(
-    n_residues: int,
-    family: str,
-    structure_dir: Optional[Path],
-    contact_threshold: float = 8.0,
-) -> np.ndarray:
-    """Return a normalised adjacency matrix using experimental Cα contacts.
-
-    Downloads the canonical crystal structure for the family from RCSB PDB
-    (NDM→3SPU, VIM→1KO3, IMP→1DDK, SPM→1X8I).  Falls back to the ±5 chain
-    graph for families without a deposited structure (GIM, SIM) or if the
-    download fails.
-
-    Crystal structure contacts capture long-range spatial relationships that
-    the chain graph misses, substantially improving score propagation for
-    enzyme families where active-site residues are sequence-distant.
-    """
-    if structure_dir is not None:
-        pdb_id = _FAMILY_PDB.get(family.upper())
-        if pdb_id:
-            pdb_path = fetch_rcsb_pdb(pdb_id, structure_dir)
-            if pdb_path is not None:
-                try:
-                    coords = parse_ca_coords(pdb_path)
-                    if len(coords) >= 10:
-                        min_len = min(len(coords), n_residues)
-                        contacts = build_contact_map_from_coords(coords[:min_len], threshold=contact_threshold)
-                        adj = np.zeros((n_residues, n_residues), dtype=np.float32)
-                        adj[:min_len, :min_len] = contacts
-                        # Chain graph for residues beyond structure coverage
-                        for i in range(min_len, n_residues):
-                            for j in range(max(0, i - 5), min(n_residues, i + 6)):
-                                adj[i, j] = 1.0
-                                adj[j, i] = 1.0
-                        np.fill_diagonal(adj, 1.0)
-                        deg = adj.sum(axis=1, keepdims=True)
-                        print(f"Structure graph ({family}, PDB {pdb_id}): "
-                              f"{int(contacts.sum())} contacts in {min_len}-residue structure")
-                        return adj / (deg + 1e-8)
-                except Exception as exc:
-                    print(f"Warning: Structure graph failed for {family} ({exc}). Using chain graph.")
-
-    # Fallback: symmetric ±5 chain graph
-    return build_chain_graph(n_residues)
-
-
-def robust_normalize(arr: np.ndarray, lo_pct: float = 1.0, hi_pct: float = 99.0) -> np.ndarray:
-    """Normalise to [0,1] using percentile clipping to suppress outlier variance spikes."""
-    lo = float(np.percentile(arr, lo_pct))
-    hi = float(np.percentile(arr, hi_pct))
-    clipped = np.clip(arr, lo, hi)
-    span = clipped.max() - clipped.min()
-    return (clipped - clipped.min()) / (span + 1e-8)
-
-
-
-
-def build_chain_graph(n_residues: int) -> np.ndarray:
-    """Fallback ±5 residue window chain graph."""
-    adj = np.zeros((n_residues, n_residues), dtype=np.float32)
-    for i in range(n_residues):
-        start = max(0, i - 5)
-        stop = min(n_residues, i + 6)
-        for j in range(start, stop):
-            if i != j:
-                adj[i, j] = 1.0
-    adj += np.eye(n_residues, dtype=np.float32)
-    degree = adj.sum(axis=1, keepdims=True)
-    return adj / (degree + 1e-8)
-
-
-def propagate_scores(initial: np.ndarray, adj_norm: np.ndarray, alpha: float, hops: int) -> np.ndarray:
-    propagated = initial.copy()
-    for _ in range(hops):
-        propagated = alpha * initial + (1.0 - alpha) * (adj_norm @ propagated)
-    propagated = (propagated - propagated.min()) / (propagated.max() - propagated.min() + 1e-8)
-    return propagated
-
-
-def compute_scores_from_train(
-    reference: SeqIO.SeqRecord,
-    train_records: Sequence[SeqIO.SeqRecord],
-    embeddings: Dict[str, np.ndarray],
-    alpha: float,
-    hops: int,
-    family: str = "VIM",
-    structure_dir: Optional[Path] = None,
-    contact_threshold: float = 8.0,
-    biophysical_weight: float = 0.10,
-) -> Dict[str, np.ndarray]:
-    ref_seq = str(reference.seq)
-    n_residues = len(ref_seq)
-
-    per_position_vectors: List[List[np.ndarray]] = [[] for _ in range(n_residues)]
-    for rec in train_records:
-        projected = project_embeddings_to_reference(ref_seq, str(rec.seq), embeddings[rec.id])
-        for pos, vec in projected.items():
-            per_position_vectors[pos].append(vec)
-
-    variance = np.zeros(n_residues, dtype=np.float32)
-    for idx, vectors in enumerate(per_position_vectors):
-        if len(vectors) >= 2:
-            stack = np.stack(vectors, axis=0)
-            variance[idx] = np.var(stack, axis=0).mean()
-
-    # Robust normalization: percentile clipping suppresses outlier variance spikes
-    var_norm = robust_normalize(variance)
-
-    # Structure-based graph (AlphaFold Cα contacts) with chain-graph fallback
-    adj_norm = build_structure_graph(
-        n_residues, family=family,
-        structure_dir=structure_dir,
-        contact_threshold=contact_threshold,
-    )
-    propagated = propagate_scores(var_norm, adj_norm, alpha=alpha, hops=hops)
-
-    # Biophysical proximity term: distance to literature-sourced active site
-    # residues in BBL numbering.
-    #
-    # NOTE on biophysical_weight default (0.10): this was an initial guess,
-    # NOT a fitted value. LR ablations (see compute_lr_baseline_scores) that
-    # learn this weight directly from data found it should be much higher
-    # and family-dependent: ~0.62 for NDM, ~0.47 for VIM, ~0.81 for IMP in
-    # initial runs (see [DECISIONS] / "LR-*-learned-*-weight" summary
-    # columns). There is no single fixed value that fits all families, so
-    # rather than hardcoding a new guess, this is exposed as --biophysical-
-    # weight; check that family's printed "LR-graph learned weights" line
-    # and pass it in directly to test whether it actually improves GBSP's
-    # ROC-AUC for that family (it improved NDM/VIM substantially in testing,
-    # but UNDERPERFORMED GBSP's default for IMP -- verify per-family, do not
-    # assume one weight generalizes).
-    active_positions = get_active_site_positions(family, ref_seq)
-    if active_positions:
-        dist = np.array(
-            [min(abs(i - a) for a in active_positions) for i in range(n_residues)],
-            dtype=np.float32,
-        )
-    else:
-        dist = np.zeros(n_residues, dtype=np.float32)
-    biophysical = robust_normalize(dist)
-    combined = (1.0 - biophysical_weight) * propagated + biophysical_weight * biophysical
-
-    return {
-        "variance": var_norm,
-        "graph": propagated,
-        "biophysical": biophysical,
-        "combined": combined,
-    }
-
-
-
-
-# ---------------------------------------------------------------------------
-# KNN baseline (k=1 in ESM-2 embedding space)
-# ---------------------------------------------------------------------------
-
-def compute_knn_scores(
-    reference: SeqIO.SeqRecord,
-    train_records: Sequence[SeqIO.SeqRecord],
-    test_records: Sequence[SeqIO.SeqRecord],
-    embeddings: Dict[str, np.ndarray],
-) -> np.ndarray:
-    """k=1 nearest-neighbour baseline in ESM-2 embedding space.
-
-    For each test sequence, find its single closest training-set neighbour
-    by mean cosine similarity across aligned residue positions.  Then score
-    each reference position by how much the test sequence's embedding at that
-    position deviates (cosine distance) from its nearest neighbour.  Positions
-    with high deviation are predicted to be mutation-tolerant.
-
-    This is the baseline recommended by ORNL: a simple sequence-similarity
-    search in embedding space that GBSP must outperform to justify its
-    added complexity.
-    """
-    ref_seq = str(reference.seq)
-    n_residues = len(ref_seq)
-
-    # Project all training embeddings to reference coordinates
-    train_projected: List[Dict[int, np.ndarray]] = []
-    for rec in train_records:
-        proj = project_embeddings_to_reference(ref_seq, str(rec.seq), embeddings[rec.id])
-        train_projected.append(proj)
-
-    if not train_projected:
-        return np.zeros(n_residues, dtype=np.float32)
-
-    # Stack per-position training matrices (n_train x embed_dim)
-    # Use NaN-fill for missing positions
-    embed_dim = next(iter(embeddings.values())).shape[-1]
-    train_matrix = np.full((len(train_projected), n_residues, embed_dim), np.nan, dtype=np.float32)
-    for t_idx, proj in enumerate(train_projected):
-        for pos, vec in proj.items():
-            train_matrix[t_idx, pos] = vec
-
-    deviation_scores = np.zeros(n_residues, dtype=np.float32)
-    counts = np.zeros(n_residues, dtype=np.int32)
-
-    for test_rec in test_records:
-        test_proj = project_embeddings_to_reference(ref_seq, str(test_rec.seq), embeddings[test_rec.id])
-
-        # Find k=1 nearest training neighbour by mean cosine similarity
-        # over positions where both test and train have valid embeddings
-        best_train_idx = _find_nearest_neighbour(test_proj, train_matrix, n_residues, embed_dim)
-
-        # Score each position by cosine distance to nearest neighbour
-        for pos, test_vec in test_proj.items():
-            if np.isnan(train_matrix[best_train_idx, pos]).any():
-                continue
-            train_vec = train_matrix[best_train_idx, pos]
-            cos_sim = _cosine_similarity(test_vec, train_vec)
-            deviation_scores[pos] += 1.0 - cos_sim  # distance = 1 - similarity
-            counts[pos] += 1
-
-    mask = counts > 0
-    deviation_scores[mask] /= counts[mask]
-
-    # Normalise to [0, 1]
-    if deviation_scores.max() > deviation_scores.min():
-        deviation_scores = (deviation_scores - deviation_scores.min()) / (
-            deviation_scores.max() - deviation_scores.min() + 1e-8
-        )
-
-    return deviation_scores
-
-
-def _cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
-    norm_a = np.linalg.norm(a)
-    norm_b = np.linalg.norm(b)
-    if norm_a < 1e-8 or norm_b < 1e-8:
-        return 0.0
-    return float(np.dot(a, b) / (norm_a * norm_b))
-
-
-def _find_nearest_neighbour(
-    test_proj: Dict[int, np.ndarray],
-    train_matrix: np.ndarray,
-    n_residues: int,
-    embed_dim: int,
-) -> int:
-    """Return index of the training sequence with highest mean cosine similarity."""
-    n_train = train_matrix.shape[0]
-    sims = np.zeros(n_train, dtype=np.float32)
-    valid_counts = np.zeros(n_train, dtype=np.int32)
-
-    for pos, test_vec in test_proj.items():
-        for t_idx in range(n_train):
-            if np.isnan(train_matrix[t_idx, pos]).any():
-                continue
-            sims[t_idx] += _cosine_similarity(test_vec, train_matrix[t_idx, pos])
-            valid_counts[t_idx] += 1
-
-    mean_sims = np.where(valid_counts > 0, sims / (valid_counts + 1e-8), -np.inf)
-    return int(np.argmax(mean_sims))
-
-
-# ---------------------------------------------------------------------------
-# Biophysical weight auto-resolution
-# ---------------------------------------------------------------------------
-
-DEFAULT_BIOPHYSICAL_WEIGHT = 0.10
-
-
-def resolve_biophysical_weight(
-    explicit_weight: Optional[float],
-    family: str,
-    output_dir: Path,
-    split_method: str,
-) -> Tuple[float, str]:
-    """Resolve the biophysical blend weight to actually use for this run.
-
-    Priority:
-      1. --biophysical-weight passed explicitly on the CLI -> use it as-is.
-      2. A previous run's cv_<family>_<split>_summary.csv in --output already
-         has a valid lr_graph_learned_biophysical_weight for this exact
-         family -- reuse it. This is the weight an LR ablation found useful
-         on this family's own data, so it's a much better default than a
-         hardcoded guess, and it stays correct even if the dataset changes
-         between runs (re-running the LR ablation updates the CSV, the next
-         run picks up the new value automatically).
-      3. Try the OTHER split method's summary (group vs random) as a weaker
-         fallback, in case only one split type has been run so far.
-      4. DEFAULT_BIOPHYSICAL_WEIGHT (0.10) if nothing usable is found --
-         e.g. first-ever run for this family, or every prior run's LR
-         ablation was NaN (degenerate folds; see MIN_CLASS_COUNT).
-
-    Returns (weight, human-readable source description for logging).
-    """
-    if explicit_weight is not None:
-        return explicit_weight, "explicit --biophysical-weight override"
-
-    for candidate_split in (split_method, "random" if split_method == "group" else "group"):
-        summary_path = output_dir / f"cv_{family.lower()}_{candidate_split}_summary.csv"
-        if not summary_path.exists():
+    for node, neighbors in edges.items():
+        if node not in parent:
             continue
+        for nbr in neighbors:
+            if nbr in parent:
+                union(node, nbr)
+
+    # Assign integer cluster IDs
+    root_to_id: Dict[str, int] = {}
+    assignments: Dict[str, int] = {}
+    for seq_id in all_ids:
+        root = find(seq_id)
+        if root not in root_to_id:
+            root_to_id[root] = len(root_to_id)
+        assignments[seq_id] = root_to_id[root]
+
+    return assignments
+
+
+# ---------------------------------------------------------------------------
+# CD-HIT clustering (kept as secondary fallback)
+# ---------------------------------------------------------------------------
+
+def _cdhit_word_length(identity: float) -> int:
+    if identity >= 0.7:
+        return 5
+    if identity >= 0.6:
+        return 4
+    if identity >= 0.5:
+        return 3
+    return 2
+
+
+def run_cdhit(fasta_path: str, output_prefix: str, identity: float) -> ClusterResult:
+    cdhit = shutil.which("cd-hit")
+    if not cdhit:
+        raise FileNotFoundError("cd-hit not found on PATH")
+
+    out_path = Path(output_prefix)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    word_len = _cdhit_word_length(identity)
+
+    cmd = [
+        cdhit,
+        "-i", str(fasta_path),
+        "-o", str(out_path),
+        "-c", str(identity),
+        "-n", str(word_len),
+        "-d", "0",
+    ]
+    subprocess.check_call(cmd)
+    clstr_path = out_path.with_suffix(out_path.suffix + ".clstr")
+    assignments = parse_cdhit_clstr(clstr_path)
+    return ClusterResult(
+        assignments=assignments,
+        cluster_count=len(set(assignments.values())),
+        method="cd-hit",
+        clstr_path=clstr_path,
+    )
+
+
+def parse_cdhit_clstr(clstr_path: Path) -> Dict[str, int]:
+    assignments: Dict[str, int] = {}
+    cluster_id: Optional[int] = None
+    with clstr_path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if line.startswith(">Cluster"):
+                cluster_id = int(line.split()[1])
+                continue
+            if cluster_id is None:
+                continue
+            match = re.search(r">([^\.\s]+)", line)
+            if match:
+                seq_id = match.group(1)
+                assignments[seq_id] = cluster_id
+    return assignments
+
+
+# ---------------------------------------------------------------------------
+# Shared helpers
+# ---------------------------------------------------------------------------
+
+def run_clustering(
+    fasta_path: str,
+    output_prefix: str,
+    identity: float,
+    method: str = "auto",
+) -> ClusterResult:
+    """Dispatch to DIAMOND → CD-HIT → greedy depending on availability.
+
+    Parameters
+    ----------
+    method: 'auto' tries DIAMOND first, then cd-hit, then greedy.
+            'diamond', 'cdhit', or 'greedy' forces a specific tool.
+    """
+    if method in {"auto", "diamond"}:
         try:
-            df = pd.read_csv(summary_path)
-            if "lr_graph_learned_biophysical_weight" not in df.columns:
-                continue
-            val = df["lr_graph_learned_biophysical_weight"].iloc[0]
-            if pd.isna(val):
-                continue
-            return float(val), (
-                f"auto-loaded from {summary_path.name} "
-                f"(split={candidate_split}, LR-graph-learned)"
-            )
-        except Exception:
-            continue
-
-    return DEFAULT_BIOPHYSICAL_WEIGHT, (
-        f"no usable prior run found for {family} in {output_dir}; "
-        f"using un-fitted default {DEFAULT_BIOPHYSICAL_WEIGHT}"
-    )
-
-
-# ---------------------------------------------------------------------------
-# Logistic Regression baseline (raw-feature ablation)
-# ---------------------------------------------------------------------------
-
-def compute_lr_baseline_scores(
-    features: np.ndarray,
-    y_true: np.ndarray,
-    n_splits: int = 5,
-    seed: int = 0,
-) -> Tuple[float, float, Optional[np.ndarray]]:
-    """Logistic regression on GBSP's raw ingredients, evaluated out-of-fold.
-
-    Ablation requested per ORNL feedback: GBSP combines per-position variance
-    and active-site distance via a FIXED formula (propagate, then
-    0.90*graph + 0.10*biophysical).  This baseline instead lets a tiny LR
-    LEARN how to combine the same two raw signals.  If LR beats GBSP, the
-    fixed combination/propagation is not adding value and should be
-    replaced with a learned blend; if GBSP beats LR, propagation is doing
-    real work.
-
-    `features` shape: (n_residues, n_features) -- e.g. [variance, biophysical]
-    (raw, pre-propagation) or [graph, biophysical] (post-propagation, GBSP's
-    own ingredients with a learned weight instead of the fixed 0.90/0.10).
-    `y_true` shape: (n_residues,) -- same labels GBSP/KNN are scored against.
-
-    Evaluated via StratifiedKFold over residue POSITIONS (not sequences) so
-    the LR itself is cross-validated; out-of-fold predictions are pooled
-    before computing ROC-AUC/PR-AUC.  Returns (nan, nan, None) if y_true has
-    too few examples of either class to stratify.
-
-    Also returns the mean (|coef|, L1-normalized) fitted weights across
-    folds so callers can report what blend the LR actually found useful --
-    e.g. "0.34 / 0.66" instead of the hardcoded "0.90 / 0.10" -- as a
-    concrete, actionable alternative rather than just a pass/fail signal.
-    """
-    n = len(y_true)
-    min_required = max(n_splits, MIN_CLASS_COUNT)
-    if y_true.sum() < min_required or (n - y_true.sum()) < min_required:
-        return float("nan"), float("nan"), None
-
-    try:
-        skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
-        oof_scores = np.zeros(n, dtype=np.float64)
-        fold_coefs: List[np.ndarray] = []
-        for train_idx, test_idx in skf.split(features, y_true):
-            clf = LogisticRegression(max_iter=1000, class_weight="balanced")
-            clf.fit(features[train_idx], y_true[train_idx])
-            oof_scores[test_idx] = clf.predict_proba(features[test_idx])[:, 1]
-            fold_coefs.append(clf.coef_[0])
-        roc = roc_auc_score(y_true, oof_scores)
-        pr = average_precision_score(y_true, oof_scores)
-        mean_coef = np.mean(np.stack(fold_coefs, axis=0), axis=0)
-        abs_coef = np.abs(mean_coef)
-        norm_weights = abs_coef / (abs_coef.sum() + 1e-8)
-        return float(roc), float(pr), norm_weights
-    except Exception as exc:
-        print(f"Warning: LR baseline failed ({exc})")
-        return float("nan"), float("nan"), None
-
-
-# ---------------------------------------------------------------------------
-# ESM-2 embedding
-# ---------------------------------------------------------------------------
-
-def embed_sequences(
-    records: Sequence[SeqIO.SeqRecord],
-    device: str,
-    batch_size: int,
-    cache_path: Optional[str],
-) -> Dict[str, np.ndarray]:
-    """Embed sequences using ESM-2 650M (esm2_t33_650M_UR50D).
-
-    See module docstring for the rationale behind this model choice.
-    """
-    import torch
-    import esm
-
-    cache: Dict[str, np.ndarray] = {}
-    if cache_path and Path(cache_path).exists():
-        data = np.load(cache_path, allow_pickle=True)
-        cache = {k: data[k] for k in data.files}
-
-    missing = [rec for rec in records if rec.id not in cache]
-    if not missing:
-        return cache
-
-    # 650M model: 33 transformer layers, 1280-dim embeddings.
-    # Chosen over 3B (over-parameterised for dataset scale) and 150M
-    # (insufficient resolution for catalytic-site residues in enzyme families).
-    model, alphabet = esm.pretrained.esm2_t33_650M_UR50D()
-    model = model.to(device).eval()
-    batch_converter = alphabet.get_batch_converter()
-
-    for start in range(0, len(missing), batch_size):
-        chunk = missing[start : start + batch_size]
-        batch = [(rec.id, str(rec.seq)) for rec in chunk]
-        _, _, toks = batch_converter(batch)
-        toks = toks.to(device)
-        with torch.no_grad():
-            out = model(toks, repr_layers=[33], return_contacts=False)
-        for i, rec in enumerate(chunk):
-            emb = out["representations"][33][i, 1 : len(rec.seq) + 1].detach().cpu().numpy()
-            cache[rec.id] = emb
-
-    if cache_path:
-        Path(cache_path).parent.mkdir(parents=True, exist_ok=True)
-        np.savez_compressed(cache_path, **cache)
-
-    return cache
-
-
-# ---------------------------------------------------------------------------
-# Argument parsing
-# ---------------------------------------------------------------------------
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="GroupKFold CV with clustering")
-    parser.add_argument("--input", required=True, help="Input FASTA file")
-    parser.add_argument("--family", default="VIM", help="Family filter: NDM, VIM, IMP, SPM, GIM, SIM")
-    parser.add_argument("--identity", type=float, default=0.2, help="Cluster identity threshold (default: 0.2)")
-    parser.add_argument("--clusters", default=None, help="Optional cluster CSV file")
-    parser.add_argument(
-        "--cluster-method",
-        choices=["auto", "diamond", "cdhit", "greedy"],
-        default="auto",
-        help=(
-            "Clustering method (default: auto). "
-            "'auto' tries DIAMOND → cd-hit → greedy. "
-            "'diamond' is recommended (BLOSUM-based)."
-        ),
-    )
-    parser.add_argument("--output", default="output/groupkfold", help="Output folder")
-    parser.add_argument("--device", default="cuda", help="cuda or cpu")
-    parser.add_argument("--batch-size", type=int, default=2, help="ESM batch size")
-    parser.add_argument("--folds", type=int, default=5, help="Number of folds")
-    parser.add_argument("--alpha", type=float, default=0.6, help="Propagation alpha")
-    parser.add_argument("--hops", type=int, default=3, help="Propagation hops (default: 3)")
-    parser.add_argument("--embed-cache", default="output/embeddings_cache.npz", help="Embedding cache path")
-    parser.add_argument("--permutations", type=int, default=200, help="Permutations for p-value estimation")
-    parser.add_argument("--bootstrap", type=int, default=500, help="Bootstrap samples for CI")
-    parser.add_argument(
-        "--structure-dir",
-        default="output/structures",
-        help="Directory to cache AlphaFold PDB structures (default: output/structures). "
-             "Set to empty string to disable structure graph and use chain graph only.",
-    )
-    parser.add_argument(
-        "--contact-threshold",
-        type=float,
-        default=8.0,
-        help="Cα–Cα distance threshold in Å for contact map (default: 8.0)",
-    )
-    parser.add_argument(
-        "--biophysical-weight",
-        type=float,
-        default=None,
-        help=(
-            "Weight (0-1) given to the active-site-distance term in GBSP's "
-            "combined score; (1-weight) goes to the propagated graph score. "
-            "If not set (default), the script AUTO-RESOLVES this per family: "
-            "it looks for a previous run's cv_<family>_<split>_summary.csv in "
-            "--output and reuses that family's lr_graph_learned_biophysical_weight "
-            "(the value an LR ablation actually found useful), falling back to "
-            "0.10 if no prior run exists. Pass this flag explicitly to override "
-            "auto-resolution. The learned weight does NOT generalize across "
-            "families -- it is resolved separately for whichever --family is "
-            "being run."
-        ),
-    )
-    parser.add_argument(
-        "--split-method",
-        choices=["group", "random"],
-        default="group",
-        help=(
-            "Sequence split strategy (default: group). "
-            "'group' = GroupKFold by DIAMOND cluster (no homolog leakage, "
-            "the honest evaluation). "
-            "'random' = plain KFold ignoring clusters -- run this to quantify "
-            "how much harder the task is under strict homology splitting "
-            "vs. a naive random split."
-        ),
-    )
-    return parser.parse_args()
-
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-
-def main() -> int:
-    args = parse_args()
-    output_dir = Path(args.output)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    # Structure dir — None disables AlphaFold graph entirely
-    structure_dir: Optional[Path] = Path(args.structure_dir) if args.structure_dir else None
-
-    all_records = read_fasta_records(args.input)
-    family = args.family.upper()
-
-    if family not in ALL_FAMILIES:
-        raise SystemExit(
-            f"Unknown family '{family}'. Must be one of: {', '.join(ALL_FAMILIES)}"
-        )
-
-    biophysical_weight, weight_source = resolve_biophysical_weight(
-        args.biophysical_weight, family, output_dir, args.split_method
-    )
-    print(f"[Weight] biophysical_weight={biophysical_weight:.3f}  (source: {weight_source})")
-
-    # Classify every sequence in the input fasta so n_sequences is verifiable,
-    # not just trusted blindly -- this also makes it visible if most of the
-    # file is unclassified ("OTHER"), which would explain a low per-family count.
-    family_counts: Dict[str, int] = {fam: 0 for fam in ALL_FAMILIES}
-    other_count = 0
-    for rec in all_records:
-        fam = family_from_header(rec.description)
-        if fam:
-            family_counts[fam] += 1
-        else:
-            other_count += 1
-    print(f"[Classification] total sequences in input: {len(all_records)}")
-    print(f"[Classification] by family: {family_counts}  |  unclassified (OTHER): {other_count}")
-
-    records = [r for r in all_records if family_from_header(r.description) == family]
-    if not records:
-        raise SystemExit(
-            f"No sequences found for family {family} in {args.input}. "
-            f"Classification counts were: {family_counts} (OTHER={other_count}). "
-            "If this family's count is 0, check that --input actually contains "
-            "this family (re-run fetch_b1_superfamily.py with --families including it)."
-        )
-
-    # Length filter: discard sequences outside the expected mature-form range
-    # for this family. This removes multi-domain/fusion proteins (too long)
-    # and fragments (too short) that were classified as family members by the
-    # header regex but are not real B1 MBL sequences. Without this filter,
-    # IMP pulled in sequences up to 889 aa (expected ~228 aa), and VIM up to
-    # 1054 aa (expected ~228 aa), causing near-universal alignment failure.
-    expected_len = _FAMILY_EXPECTED_LENGTH.get(family, 250)
-    lo = int(expected_len * LENGTH_FILTER_LO)
-    hi = int(expected_len * LENGTH_FILTER_HI)
-    records_before = len(records)
-    records = [r for r in records if lo <= len(str(r.seq)) <= hi]
-    n_dropped = records_before - len(records)
-    if n_dropped:
-        print(
-            f"[{family}] length filter [{lo}–{hi} aa = {LENGTH_FILTER_LO:.0%}–"
-            f"{LENGTH_FILTER_HI:.0%} × expected {expected_len} aa]: "
-            f"kept {len(records)}/{records_before} sequences, "
-            f"dropped {n_dropped} outliers (fragments / multi-domain / precursors)"
-        )
-    if not records:
-        raise SystemExit(
-            f"No {family} sequences survived the length filter [{lo}–{hi} aa]. "
-            "The fetched dataset may be heavily contaminated -- re-run "
-            "fetch_b1_superfamily.py with --min-length and --max-length set "
-            f"to approximately {lo} and {hi}."
-        )
-
-    # Length-distribution diagnostic on the FILTERED dataset
-    family_lengths = sorted(len(str(r.seq)) for r in records)
-    if family_lengths:
-        n = len(family_lengths)
-        p25 = family_lengths[n // 4]
-        p50 = family_lengths[n // 2]
-        p75 = family_lengths[min(n - 1, 3 * n // 4)]
-        print(
-            f"[{family}] sequence length distribution (after filter): "
-            f"min={family_lengths[0]}, p25={p25}, median={p50}, p75={p75}, "
-            f"max={family_lengths[-1]}  (n={n})"
-        )
-
-    # ------------------------------------------------------------------
-    # Clustering (moved before reference selection: choose_reference now
-    # uses family_assignments to anchor on the largest cluster instead of
-    # an arbitrary records[0] -- see choose_reference docstring for why).
-    # ------------------------------------------------------------------
-    cluster_csv = None
-    if args.clusters:
-        cluster_csv = args.clusters
-        assignments = load_cluster_csv(cluster_csv)
-    else:
-        cluster_csv = str(output_dir / f"clusters_{family.lower()}.csv")
-        result = run_clustering(
-            fasta_path=args.input,
-            output_prefix=str(output_dir / f"cluster_{family.lower()}"),
-            identity=args.identity,
-            method=args.cluster_method,
-        )
-        assignments = result.assignments
-        write_cluster_csv(assignments, cluster_csv)
-
-    # ------------------------------------------------------------------
-    # Corrected per-family cluster report.
-    # NOTE: `assignments` covers the ENTIRE superfamily fasta (DIAMOND was
-    # run on args.input, not a family-filtered fasta), so we filter down to
-    # this family's own sequences before reporting cluster statistics.
-    # ------------------------------------------------------------------
-    family_seq_ids = {rec.id for rec in records}
-    family_assignments = {sid: cid for sid, cid in assignments.items() if sid in family_seq_ids}
-    cluster_sizes = Counter(family_assignments.values())
-    median_cluster_size = float("nan")
-    max_cluster_size = 0
-    max_cluster_fraction = float("nan")
-    if cluster_sizes:
-        size_vals = sorted(cluster_sizes.values())
-        median_cluster_size = size_vals[len(size_vals) // 2]
-        n_singletons = sum(1 for s in size_vals if s == 1)
-        max_cluster_size = max(size_vals)
-        max_cluster_fraction = max_cluster_size / max(1, len(family_seq_ids))
-        print(
-            f"\n[{family}] sequences: {len(family_seq_ids)} | "
-            f"clusters (this family): {len(cluster_sizes)} | "
-            f"median cluster size: {median_cluster_size} | "
-            f"max: {max_cluster_size} ({max_cluster_fraction:.0%} of family) | "
-            f"singletons: {n_singletons}"
-        )
-
-    # ------------------------------------------------------------------
-    # Reference selection (uses family_assignments computed above to anchor
-    # on the largest cluster -- see choose_reference docstring) and the
-    # resulting train/test pool.
-    # ------------------------------------------------------------------
-    reference = choose_reference(records, family, family_assignments)
-    non_reference = [r for r in records if r.id != reference.id]
-    groups = [family_assignments.get(rec.id, -1) for rec in non_reference]
-    unique_groups = len(set(groups))
-    n_samples = len(non_reference)
-
-    # One-time alignment-coverage diagnostic: how many of this family's
-    # sequences actually align well to the chosen reference? A low-coverage
-    # sequence (signal peptide mismatch, fragment, big indel) contributes
-    # mostly gap/unmapped positions, which used to be silently counted as
-    # "variant" -- see project_variant_positions docstring for the bug this
-    # exposed (IMP/VIM coming back with ~100% of positions flagged variant
-    # in every fold). This print makes the coverage distribution visible so
-    # a bad reference choice or a fragment-heavy dataset shows up directly.
-    ref_seq_for_coverage = str(reference.seq)
-    coverages = [alignment_coverage(ref_seq_for_coverage, str(r.seq)) for r in non_reference]
-    n_low_coverage = sum(1 for c in coverages if c < MIN_ALIGNMENT_COVERAGE)
-    if coverages:
-        print(
-            f"[{family}] alignment coverage to reference: "
-            f"mean={np.mean(coverages):.2f}, median={np.median(coverages):.2f}, "
-            f"{n_low_coverage}/{len(coverages)} sequences below "
-            f"{MIN_ALIGNMENT_COVERAGE:.0%} coverage (excluded from variant labeling)"
-        )
-
-    if unique_groups < 2 or n_samples < 2:
-        summary_path = output_dir / f"cv_{family.lower()}_summary.csv"
-        pd.DataFrame(
-            [
-                {
-                    "family": family,
-                    "n_folds": 0,
-                    "mean_roc_auc": float("nan"),
-                    "std_roc_auc": float("nan"),
-                    "mean_pr_auc": float("nan"),
-                    "std_pr_auc": float("nan"),
-                    "knn_mean_roc_auc": float("nan"),
-                    "knn_std_roc_auc": float("nan"),
-                    "note": "Not enough clusters or samples for GroupKFold",
-                }
-            ]
-        ).to_csv(summary_path, index=False)
-        print("Not enough clusters/samples for GroupKFold. Need >=2 clusters and >=2 sequences.")
-        print(f"Saved summary to {summary_path}")
-        return 0
-
-    n_splits = min(args.folds, unique_groups, n_samples)
-    if n_splits < 2:
-        n_splits = 2
-
-    if args.split_method == "random":
-        kf = KFold(n_splits=n_splits, shuffle=True, random_state=42)
-        split_iter = kf.split(non_reference)
-        print(f"[{family}] Split method: RANDOM KFold (n_splits={n_splits}) -- "
-              "ignores cluster structure; expect inflated scores vs. 'group'.")
-    else:
-        gkf = GroupKFold(n_splits=n_splits)
-        split_iter = gkf.split(non_reference, groups=groups)
-        print(f"[{family}] Split method: GroupKFold by DIAMOND cluster (n_splits={n_splits})")
-
-    device = args.device
-    try:
-        import torch
-        if device == "cuda" and not torch.cuda.is_available():
-            device = "cpu"
-    except Exception:
-        device = "cpu"
-
-    embeddings = embed_sequences(
-        records, device=device, batch_size=args.batch_size, cache_path=args.embed_cache
-    )
-
-    # ------------------------------------------------------------------
-    # Cross-validation
-    # ------------------------------------------------------------------
-    fold_rows = []
-    roc_curves_gbsp = []
-    pr_curves_gbsp = []
-    roc_curves_knn = []
-    pr_curves_knn = []
-    aucs_gbsp = []
-    aps_gbsp = []
-    aucs_knn = []
-    aps_knn = []
-    aucs_lr = []
-    aps_lr = []
-    aucs_lr_graph = []
-    aps_lr_graph = []
-    lr_raw_weights_per_fold: List[np.ndarray] = []
-    lr_graph_weights_per_fold: List[np.ndarray] = []
-    skipped_fold_reasons: List[str] = []
-    fold_labels = []
-    fold_scores_gbsp = []
-
-    ref_seq = str(reference.seq)
-
-    for fold_idx, (train_idx, test_idx) in enumerate(split_iter, start=1):
-        train_records = [reference] + [non_reference[i] for i in train_idx]
-        test_records = [non_reference[i] for i in test_idx]
-
-        # GBSP scores
-        scores = compute_scores_from_train(
-            reference, train_records, embeddings,
-            alpha=args.alpha, hops=args.hops, family=family,
-            structure_dir=structure_dir,
-            contact_threshold=args.contact_threshold,
-            biophysical_weight=biophysical_weight,
-        )
-
-        # KNN baseline (k=1)
-        knn_scores = compute_knn_scores(reference, train_records, test_records, embeddings)
-
-        # Labels: positions that vary in test sequences relative to reference.
-        # Sequences below MIN_ALIGNMENT_COVERAGE are excluded here -- a
-        # fragment/precursor-mismatched sequence contributes mostly gap
-        # positions, which (since the project_variant_positions fix) no
-        # longer count as "variant" on their own, but a low-coverage
-        # sequence's few aligned positions can still be noisy local
-        # mismatches rather than real substitutions, so it's safest to
-        # exclude such sequences from contributing labels entirely.
-        positive_positions: List[int] = []
-        n_excluded_low_coverage = 0
-        for rec in test_records:
-            if alignment_coverage(ref_seq, str(rec.seq)) < MIN_ALIGNMENT_COVERAGE:
-                n_excluded_low_coverage += 1
-                continue
-            positive_positions.extend(project_variant_positions(ref_seq, str(rec.seq)))
-        positive_positions = sorted(set(positive_positions))
-
-        y_true = np.array(
-            [1 if i in positive_positions else 0 for i in range(len(ref_seq))], dtype=int
-        )
-        n_pos = int(y_true.sum())
-        n_neg = int(len(y_true) - n_pos)
-        if n_pos < MIN_CLASS_COUNT or n_neg < MIN_CLASS_COUNT:
-            skipped_fold_reasons.append(
-                f"fold {fold_idx}: n_test={len(test_records)} "
-                f"({n_excluded_low_coverage} excluded for low alignment coverage), "
-                f"positive_positions={n_pos}, negative_positions={n_neg} "
-                f"(need >= {MIN_CLASS_COUNT} of each)"
-            )
-            continue
-
-        # GBSP metrics
-        roc_auc_gbsp = roc_auc_score(y_true, scores["combined"])
-        ap_gbsp = average_precision_score(y_true, scores["combined"])
-        fpr_gbsp, tpr_gbsp, _ = roc_curve(y_true, scores["combined"])
-        prec_gbsp, rec_gbsp, _ = precision_recall_curve(y_true, scores["combined"])
-
-        # KNN metrics
-        roc_auc_knn = roc_auc_score(y_true, knn_scores)
-        ap_knn = average_precision_score(y_true, knn_scores)
-        fpr_knn, tpr_knn, _ = roc_curve(y_true, knn_scores)
-        prec_knn, rec_knn, _ = precision_recall_curve(y_true, knn_scores)
-
-        # LR baseline A: learned combination of GBSP's raw (pre-propagation)
-        # ingredients -- variance + biophysical distance.
-        lr_features = np.stack([scores["variance"], scores["biophysical"]], axis=1)
-        roc_auc_lr, ap_lr, lr_weights = compute_lr_baseline_scores(lr_features, y_true)
-        if lr_weights is not None:
-            lr_raw_weights_per_fold.append(lr_weights)
-
-        # LR baseline B: learned combination of the POST-propagation graph
-        # score + biophysical distance -- GBSP's exact two ingredients, but
-        # with a learned blend weight instead of the hardcoded 0.90/0.10.
-        # Comparing A vs B isolates whether propagation itself helps/hurts
-        # independent of the fixed weighting: if B beats A, propagation adds
-        # signal and only the fixed weight was wrong; if B is no better than
-        # A, propagation itself is destroying signal regardless of weighting.
-        lr_graph_features = np.stack([scores["graph"], scores["biophysical"]], axis=1)
-        roc_auc_lr_graph, ap_lr_graph, lr_graph_weights = compute_lr_baseline_scores(lr_graph_features, y_true)
-        if lr_graph_weights is not None:
-            lr_graph_weights_per_fold.append(lr_graph_weights)
-
-        aucs_gbsp.append(roc_auc_gbsp)
-        aps_gbsp.append(ap_gbsp)
-        aucs_knn.append(roc_auc_knn)
-        aps_knn.append(ap_knn)
-        aucs_lr.append(roc_auc_lr)
-        aps_lr.append(ap_lr)
-        aucs_lr_graph.append(roc_auc_lr_graph)
-        aps_lr_graph.append(ap_lr_graph)
-
-        roc_curves_gbsp.append((fpr_gbsp, tpr_gbsp, roc_auc_gbsp))
-        pr_curves_gbsp.append((rec_gbsp, prec_gbsp, ap_gbsp))
-        roc_curves_knn.append((fpr_knn, tpr_knn, roc_auc_knn))
-        pr_curves_knn.append((rec_knn, prec_knn, ap_knn))
-
-        fold_labels.append(y_true)
-        fold_scores_gbsp.append(scores["combined"])
-
-        fold_rows.append(
-            {
-                "fold": fold_idx,
-                "n_train": len(train_records),
-                "n_test": len(test_records),
-                "n_positive_positions": int(y_true.sum()),
-                "gbsp_roc_auc": roc_auc_gbsp,
-                "gbsp_pr_auc": ap_gbsp,
-                "knn_roc_auc": roc_auc_knn,
-                "knn_pr_auc": ap_knn,
-                "lr_raw_roc_auc": roc_auc_lr,
-                "lr_raw_pr_auc": ap_lr,
-                "lr_graph_roc_auc": roc_auc_lr_graph,
-                "lr_graph_pr_auc": ap_lr_graph,
-            }
-        )
-
-    fold_df = pd.DataFrame(fold_rows)
-    out_tag = f"{family.lower()}_{args.split_method}"
-    fold_df.to_csv(output_dir / f"cv_{out_tag}_folds.csv", index=False)
-
-    if not aucs_gbsp:
-        print(f"\n[WARNING] All {n_splits} folds for {family} were skipped -- every fold's "
-              f"test set produced fewer than {MIN_CLASS_COUNT} positive or fewer than "
-              f"{MIN_CLASS_COUNT} negative residue positions, so no fold had enough "
-              "signal to score reliably. All metrics below will be NaN.")
-        for reason in skipped_fold_reasons:
-            print(f"    skipped {reason}")
-        print("  Likely cause: cluster-size imbalance starving GroupKFold of diverse test "
-              "sets (a fold whose test sequences are nearly identical to the reference "
-              "produces ~0 positive positions; a fold dominated by one huge cluster can "
-              "produce the opposite extreme). Try: --split-method random to check if this "
-              "is a clustering artifact, or --cluster-identity 0.5/0.7 to rebalance cluster "
-              "sizes, or --folds 3 to use larger/coarser folds.")
-
-    mean_auc = float(np.mean(aucs_gbsp)) if aucs_gbsp else float("nan")
-    std_auc = float(np.std(aucs_gbsp)) if aucs_gbsp else float("nan")
-    mean_ap = float(np.mean(aps_gbsp)) if aps_gbsp else float("nan")
-    std_ap = float(np.std(aps_gbsp)) if aps_gbsp else float("nan")
-
-    mean_auc_knn = float(np.mean(aucs_knn)) if aucs_knn else float("nan")
-    std_auc_knn = float(np.std(aucs_knn)) if aucs_knn else float("nan")
-    mean_ap_knn = float(np.mean(aps_knn)) if aps_knn else float("nan")
-    std_ap_knn = float(np.std(aps_knn)) if aps_knn else float("nan")
-
-    valid_lr_auc = [v for v in aucs_lr if not np.isnan(v)]
-    valid_lr_ap = [v for v in aps_lr if not np.isnan(v)]
-    mean_auc_lr = float(np.mean(valid_lr_auc)) if valid_lr_auc else float("nan")
-    std_auc_lr = float(np.std(valid_lr_auc)) if valid_lr_auc else float("nan")
-    mean_ap_lr = float(np.mean(valid_lr_ap)) if valid_lr_ap else float("nan")
-    std_ap_lr = float(np.std(valid_lr_ap)) if valid_lr_ap else float("nan")
-
-    valid_lr_graph_auc = [v for v in aucs_lr_graph if not np.isnan(v)]
-    valid_lr_graph_ap = [v for v in aps_lr_graph if not np.isnan(v)]
-    mean_auc_lr_graph = float(np.mean(valid_lr_graph_auc)) if valid_lr_graph_auc else float("nan")
-    std_auc_lr_graph = float(np.std(valid_lr_graph_auc)) if valid_lr_graph_auc else float("nan")
-    mean_ap_lr_graph = float(np.mean(valid_lr_graph_ap)) if valid_lr_graph_ap else float("nan")
-    std_ap_lr_graph = float(np.std(valid_lr_graph_ap)) if valid_lr_graph_ap else float("nan")
-
-    # Mean learned blend weights across folds: [signal_weight, biophysical_weight]
-    mean_lr_raw_weights = (
-        np.mean(np.stack(lr_raw_weights_per_fold, axis=0), axis=0)
-        if lr_raw_weights_per_fold else None
-    )
-    mean_lr_graph_weights = (
-        np.mean(np.stack(lr_graph_weights_per_fold, axis=0), axis=0)
-        if lr_graph_weights_per_fold else None
-    )
-
-    # Bootstrap CI for mean AUC/AP (GBSP)
-    ci_auc_lower = ci_auc_upper = ci_ap_lower = ci_ap_upper = float("nan")
-    if len(aucs_gbsp) >= 2:
-        rng = np.random.default_rng(42)
-        boot_means_auc = []
-        boot_means_ap = []
-        for _ in range(args.bootstrap):
-            idx = rng.integers(0, len(aucs_gbsp), len(aucs_gbsp))
-            boot_means_auc.append(np.mean(np.array(aucs_gbsp)[idx]))
-            boot_means_ap.append(np.mean(np.array(aps_gbsp)[idx]))
-        ci_auc_lower = float(np.percentile(boot_means_auc, 2.5))
-        ci_auc_upper = float(np.percentile(boot_means_auc, 97.5))
-        ci_ap_lower = float(np.percentile(boot_means_ap, 2.5))
-        ci_ap_upper = float(np.percentile(boot_means_ap, 97.5))
-
-    # Permutation test vs random baseline (GBSP)
-    p_value_auc = p_value_ap = float("nan")
-    if fold_labels and args.permutations > 0:
-        rng = np.random.default_rng(123)
-        perm_mean_auc = []
-        perm_mean_ap = []
-        for _ in range(args.permutations):
-            perm_aucs = []
-            perm_aps = []
-            for y_true, y_scores in zip(fold_labels, fold_scores_gbsp):
-                y_perm = rng.permutation(y_true)
-                if y_perm.sum() == 0 or y_perm.sum() == len(y_perm):
-                    continue
-                perm_aucs.append(roc_auc_score(y_perm, y_scores))
-                perm_aps.append(average_precision_score(y_perm, y_scores))
-            if perm_aucs:
-                perm_mean_auc.append(np.mean(perm_aucs))
-            if perm_aps:
-                perm_mean_ap.append(np.mean(perm_aps))
-        if perm_mean_auc:
-            p_value_auc = float(
-                (np.sum(np.array(perm_mean_auc) >= mean_auc) + 1) / (len(perm_mean_auc) + 1)
-            )
-        if perm_mean_ap:
-            p_value_ap = float(
-                (np.sum(np.array(perm_mean_ap) >= mean_ap) + 1) / (len(perm_mean_ap) + 1)
-            )
-
-    summary = {
-        "family": family,
-        "split_method": args.split_method,
-        "biophysical_weight_used": biophysical_weight,
-        "biophysical_weight_source": weight_source,
-        "n_folds": len(aucs_gbsp),
-        "n_sequences": len(family_seq_ids),
-        "n_clusters_family": len(cluster_sizes) if cluster_sizes else 0,
-        "median_cluster_size": median_cluster_size,
-        "max_cluster_size": max_cluster_size,
-        "max_cluster_fraction": max_cluster_fraction,
-        "n_folds_skipped": len(skipped_fold_reasons),
-        # GBSP
-        "gbsp_mean_roc_auc": mean_auc,
-        "gbsp_std_roc_auc": std_auc,
-        "gbsp_mean_pr_auc": mean_ap,
-        "gbsp_std_pr_auc": std_ap,
-        "gbsp_ci_roc_auc_lower": ci_auc_lower,
-        "gbsp_ci_roc_auc_upper": ci_auc_upper,
-        "gbsp_ci_pr_auc_lower": ci_ap_lower,
-        "gbsp_ci_pr_auc_upper": ci_ap_upper,
-        "gbsp_p_value_roc_auc": p_value_auc,
-        "gbsp_p_value_pr_auc": p_value_ap,
-        # KNN baseline
-        "knn_mean_roc_auc": mean_auc_knn,
-        "knn_std_roc_auc": std_auc_knn,
-        "knn_mean_pr_auc": mean_ap_knn,
-        "knn_std_pr_auc": std_ap_knn,
-        # LR baseline A: learned blend of raw (pre-propagation) ingredients
-        "lr_raw_mean_roc_auc": mean_auc_lr,
-        "lr_raw_std_roc_auc": std_auc_lr,
-        "lr_raw_mean_pr_auc": mean_ap_lr,
-        "lr_raw_std_pr_auc": std_ap_lr,
-        "lr_raw_learned_signal_weight": float(mean_lr_raw_weights[0]) if mean_lr_raw_weights is not None else float("nan"),
-        "lr_raw_learned_biophysical_weight": float(mean_lr_raw_weights[1]) if mean_lr_raw_weights is not None else float("nan"),
-        # LR baseline B: learned blend of GBSP's exact (post-propagation) ingredients
-        "lr_graph_mean_roc_auc": mean_auc_lr_graph,
-        "lr_graph_std_roc_auc": std_auc_lr_graph,
-        "lr_graph_mean_pr_auc": mean_ap_lr_graph,
-        "lr_graph_std_pr_auc": std_ap_lr_graph,
-        "lr_graph_learned_signal_weight": float(mean_lr_graph_weights[0]) if mean_lr_graph_weights is not None else float("nan"),
-        "lr_graph_learned_biophysical_weight": float(mean_lr_graph_weights[1]) if mean_lr_graph_weights is not None else float("nan"),
-        # Convenience deltas
-        "delta_roc_auc_gbsp_minus_knn": mean_auc - mean_auc_knn,
-        "delta_roc_auc_gbsp_minus_lr_raw": mean_auc - mean_auc_lr,
-        "delta_roc_auc_gbsp_minus_lr_graph": mean_auc - mean_auc_lr_graph,
-        "delta_roc_auc_lr_graph_minus_lr_raw": mean_auc_lr_graph - mean_auc_lr,
-    }
-    pd.DataFrame([summary]).to_csv(output_dir / f"cv_{out_tag}_summary.csv", index=False)
-
-    # ------------------------------------------------------------------
-    # Plots: GBSP and KNN side-by-side on the same axes
-    # ------------------------------------------------------------------
-    import matplotlib.pyplot as plt
-
-    fig, axes = plt.subplots(1, 2, figsize=(13, 5))
-
-    for fpr, tpr, auc_val in roc_curves_gbsp:
-        axes[0].plot(fpr, tpr, color="steelblue", alpha=0.35, label=f"GBSP AUC={auc_val:.3f}")
-    for fpr, tpr, auc_val in roc_curves_knn:
-        axes[0].plot(fpr, tpr, color="tomato", alpha=0.35, linestyle="--", label=f"KNN AUC={auc_val:.3f}")
-    axes[0].plot([0, 1], [0, 1], "k--", linewidth=1)
-    axes[0].set_xlabel("False Positive Rate")
-    axes[0].set_ylabel("True Positive Rate")
-    axes[0].set_title(
-        f"ROC  GBSP={mean_auc:.3f}±{std_auc:.3f}  KNN={mean_auc_knn:.3f}±{std_auc_knn:.3f}"
-    )
-
-    for rec, prec, ap in pr_curves_gbsp:
-        axes[1].plot(rec, prec, color="steelblue", alpha=0.35, label=f"GBSP AP={ap:.3f}")
-    for rec, prec, ap in pr_curves_knn:
-        axes[1].plot(rec, prec, color="tomato", alpha=0.35, linestyle="--", label=f"KNN AP={ap:.3f}")
-    axes[1].set_xlabel("Recall")
-    axes[1].set_ylabel("Precision")
-    axes[1].set_title(
-        f"PR  GBSP={mean_ap:.3f}±{std_ap:.3f}  KNN={mean_ap_knn:.3f}±{std_ap_knn:.3f}"
-    )
-
-    for ax in axes:
-        ax.grid(True, alpha=0.2)
-        handles, labels = ax.get_legend_handles_labels()
-        by_label = dict(zip(labels, handles))
-        ax.legend(by_label.values(), by_label.keys(), fontsize=7)
-
-    fig.tight_layout()
-    fig_path = output_dir / f"cv_{out_tag}_roc_pr.png"
-    fig.savefig(fig_path, dpi=200)
-    plt.close(fig)
-
-    print(f"Saved fold metrics: {output_dir / f'cv_{out_tag}_folds.csv'}")
-    print(f"Saved summary:      {output_dir / f'cv_{out_tag}_summary.csv'}")
-    print(f"Saved ROC/PR plot:  {fig_path}")
-    print(f"\n[{family} / {args.split_method}] GBSP     ROC-AUC: {mean_auc:.4f} ± {std_auc:.4f}  "
-          "(propagated graph score, fixed 0.90/0.10 blend)")
-    print(f"[{family} / {args.split_method}] KNN      ROC-AUC: {mean_auc_knn:.4f} ± {std_auc_knn:.4f}  "
-          f"(delta vs GBSP={mean_auc - mean_auc_knn:+.4f})")
-    print(f"[{family} / {args.split_method}] LR-raw   ROC-AUC: {mean_auc_lr:.4f} ± {std_auc_lr:.4f}  "
-          f"(learned blend of PRE-propagation variance + biophysical; "
-          f"delta vs GBSP={mean_auc - mean_auc_lr:+.4f})")
-    print(f"[{family} / {args.split_method}] LR-graph ROC-AUC: {mean_auc_lr_graph:.4f} ± {std_auc_lr_graph:.4f}  "
-          f"(learned blend of GBSP's own POST-propagation graph score + biophysical; "
-          f"delta vs GBSP={mean_auc - mean_auc_lr_graph:+.4f})")
-    if mean_lr_raw_weights is not None:
-        print(f"  LR-raw learned weights:   signal={mean_lr_raw_weights[0]:.2f} / "
-              f"biophysical={mean_lr_raw_weights[1]:.2f}  (vs GBSP's hardcoded N/A / N/A, raw has no fixed blend)")
-    if mean_lr_graph_weights is not None:
-        print(f"  LR-graph learned weights: graph={mean_lr_graph_weights[0]:.2f} / "
-              f"biophysical={mean_lr_graph_weights[1]:.2f}  (vs GBSP's hardcoded 0.90 / 0.10)")
-
-    # ------------------------------------------------------------------
-    # Decision rules (printed, not enforced) -- flags worth acting on
-    # ------------------------------------------------------------------
-    print(f"\n[DECISIONS for {family} / {args.split_method}]")
-    if len(family_seq_ids) < 200:
-        print(f"  - n_sequences={len(family_seq_ids)} < 200: dataset is small; "
-              "consider relaxing UniProt filters or pulling in more related sequences.")
-    if not np.isnan(median_cluster_size) and median_cluster_size == 1:
-        print("  - median_cluster_size=1: clustering is fragmented for this family; "
-              "retry fetch/cluster step with --cluster-identity 0.5 and 0.7 and compare.")
-    if not np.isnan(max_cluster_fraction) and max_cluster_fraction > 0.40:
-        print(f"  - one cluster holds {max_cluster_fraction:.0%} of all {family} sequences "
-              f"({max_cluster_size}/{len(family_seq_ids)}): GroupKFold will frequently put this "
-              "whole supercluster in a single fold, starving other folds of train/test diversity "
-              "and risking degenerate (all-same-label) folds. Consider --cluster-identity 0.5/0.7 "
-              "to split this cluster into smaller, more homogeneous sub-clusters.")
-    if not aucs_gbsp:
-        print(f"  - 0/{n_splits} folds had enough class balance to score (see [WARNING] above): "
-              "results for this family/split are unusable as-is. Address the cluster-imbalance "
-              "or dataset-size issues above before trusting any number from this run.")
-    if not np.isnan(mean_auc_knn) and abs(mean_auc - mean_auc_knn) < 0.02:
-        print("  - |GBSP-KNN| < 0.02: graph propagation adds negligible value over "
-              "naive k=1 similarity search for this family.")
-    if len(aucs_gbsp) == 1:
-        print("  - Only 1/{} folds produced a usable score: the reported GBSP/KNN ROC-AUC is a "
-              "single point estimate, not a mean -- treat std=0.0000 as 'undefined', not "
-              "'perfectly stable'. Do not report this number without that caveat.".format(n_splits))
-
-    # Isolate whether the FIXED 0.90/0.10 weighting or PROPAGATION ITSELF
-    # is responsible for any GBSP underperformance vs the LR ablations.
-    if not np.isnan(mean_auc_lr) and not np.isnan(mean_auc_lr_graph):
-        if mean_auc_lr_graph > mean_auc + 0.02 and mean_auc_lr_graph >= mean_auc_lr - 0.02:
-            if mean_lr_graph_weights is not None:
-                print(f"  - LR-graph ({mean_auc_lr_graph:.3f}) beats GBSP ({mean_auc:.3f}) and matches/beats "
-                      f"LR-raw ({mean_auc_lr:.3f}): propagation itself is fine -- the hardcoded 0.90/0.10 "
-                      "blend weight is the problem. Fix: use the learned weight instead "
-                      f"(graph={mean_lr_graph_weights[0]:.2f} / biophysical={mean_lr_graph_weights[1]:.2f}) "
-                      "rather than the fixed 0.90/0.10 ratio.")
-            else:
-                print(f"  - LR-graph ({mean_auc_lr_graph:.3f}) beats GBSP ({mean_auc:.3f}) and matches/beats "
-                      f"LR-raw ({mean_auc_lr:.3f}): propagation itself is fine -- the hardcoded 0.90/0.10 "
-                      "blend weight is the problem. Fix: learn the blend weight instead of hardcoding it.")
-        elif mean_auc_lr > mean_auc_lr_graph + 0.02:
-            print(f"  - LR-raw ({mean_auc_lr:.3f}) beats LR-graph ({mean_auc_lr_graph:.3f}) even though "
-                  f"both use a LEARNED weight: propagation (alpha={args.alpha:.2f}, hops={args.hops}) "
-                  "is destroying signal regardless of how it's weighted. Fix: lower hops, raise alpha "
-                  "(less smoothing), or try --structure-dir '' to compare against the chain-graph "
-                  "fallback directly.")
-        elif mean_auc_lr_graph > mean_auc + 0.02:
-            print(f"  - LR-graph ({mean_auc_lr_graph:.3f}) beats GBSP ({mean_auc:.3f}): even using GBSP's "
-                  "own post-propagation signal, a learned blend beats the fixed 0.90/0.10 ratio. "
-                  "Fix: learn the blend weight instead of hardcoding it.")
-
-    if args.split_method == "group":
-        print("  - Run the same family with --split-method random to quantify how much "
-              "homology-aware splitting is responsible for the score (compare cv_"
-              f"{family.lower()}_random_summary.csv once produced).")
-    elif args.split_method == "random":
-        group_summary_path = output_dir / f"cv_{family.lower()}_group_summary.csv"
-        if group_summary_path.exists():
-            try:
-                group_auc = pd.read_csv(group_summary_path)["gbsp_mean_roc_auc"].iloc[0]
-                if mean_auc - group_auc > 0.10:
-                    print(f"  - random-split AUC ({mean_auc:.3f}) exceeds group-split AUC "
-                          f"({group_auc:.3f}) by >0.10: task difficulty is driven mostly by "
-                          "homology-split strictness, not the method itself. Report both "
-                          "numbers together; don't cite the random-split number alone.")
-            except Exception:
-                pass
-
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
+            result = run_diamond(fasta_path, output_prefix, identity)
+            print(f"DIAMOND clustering complete: {result.cluster_count} clusters")
+            return result
+        except FileNotFoundError:
+            if method == "diamond":
+                raise SystemExit(
+                    "DIAMOND not found. Install with: conda install -c bioconda diamond"
+                )
+
+    if method in {"auto", "cdhit"}:
+        try:
+            result = run_cdhit(fasta_path, output_prefix, identity)
+            print(f"CD-HIT clustering complete: {result.cluster_count} clusters")
+            return result
+        except FileNotFoundError:
+            if method == "cdhit":
+                raise SystemExit("cd-hit not found. Install it or use --method greedy.")
+
+    records = read_fasta_records(fasta_path)
+    result = greedy_cluster(records, identity)
+    print(f"Greedy clustering complete: {result.cluster_count} clusters")
+    return result
+
+
+def write_cluster_csv(assignments: Dict[str, int], output_csv: str) -> None:
+    out_path = Path(output_csv)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    lines = ["sequence_id,cluster_id"]
+    for seq_id, cluster_id in sorted(assignments.items(), key=lambda x: (x[1], x[0])):
+        lines.append(f"{seq_id},{cluster_id}")
+    out_path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def load_cluster_csv(path: str) -> Dict[str, int]:
+    assignments: Dict[str, int] = {}
+    with Path(path).open("r", encoding="utf-8") as handle:
+        next(handle, None)
+        for line in handle:
+            seq_id, cluster_id = line.strip().split(",")
+            assignments[seq_id] = int(cluster_id)
+    return assignments
